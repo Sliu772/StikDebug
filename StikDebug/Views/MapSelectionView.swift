@@ -835,6 +835,8 @@ struct LocationSimulationView: View {
     @State private var wanderMode = false
     @State private var wanderRadius: Double = 500
     @State private var wanderSpeedFactor: Double = 1.0
+    @State private var wanderGoTarget: CLLocationCoordinate2D?
+    @State private var wanderGoRequested: CLLocationCoordinate2D?
     @State private var wanderZoneCenter: CLLocationCoordinate2D?
 
     private static let routeDurationFormatter: DateComponentsFormatter = {
@@ -996,6 +998,10 @@ struct LocationSimulationView: View {
                         if let displayedRouteCoordinate {
                             Marker("Current", coordinate: displayedRouteCoordinate)
                                 .tint(.blue)
+                        }
+                        if let wanderGoTarget {
+                            Marker("Go", coordinate: wanderGoTarget)
+                                .tint(.orange)
                         }
                     } else if let coordinate {
                         Marker("Pin", coordinate: coordinate)
@@ -1449,6 +1455,18 @@ struct LocationSimulationView: View {
                 .pickerStyle(.segmented)
             }
 
+            if wanderZoneCenter != nil {
+                if wanderGoTarget != nil {
+                    Button("Go here") { wanderGoRequested = wanderGoTarget }
+                        .buttonStyle(.borderedProminent)
+                        .tint(.orange)
+                } else {
+                    Text("Tap the map to pick a place to drive to")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
             HStack(spacing: 12) {
                 Button("Stop", action: clear)
                     .buttonStyle(.bordered)
@@ -1550,6 +1568,8 @@ struct LocationSimulationView: View {
         cancelRoutePlayback(resetMarker: true)
         stopResendLoop()
         wanderZoneCenter = nil
+        wanderGoTarget = nil
+        wanderGoRequested = nil
         LocationSimulationSession.shared.clearRoute()
         runLocationCommand(
             errorTitle: "Clear Failed",
@@ -1596,6 +1616,11 @@ struct LocationSimulationView: View {
     }
 
     private func applySelection(_ coordinate: CLLocationCoordinate2D) {
+        if wanderZoneCenter != nil {
+            // While wandering, a tap picks a place to drive to.
+            wanderGoTarget = coordinate
+            return
+        }
         guard !isRouteRunning else { return }
         if hasRouteContext {
             resetRouteSelection()
@@ -1777,7 +1802,8 @@ struct LocationSimulationView: View {
     private func playSamples(
         _ samples: [RoutePlaybackSample],
         routeID: UUID,
-        lastSuccessfulCoordinate: inout CLLocationCoordinate2D?
+        lastSuccessfulCoordinate: inout CLLocationCoordinate2D?,
+        stopWhen: (() -> Bool)? = nil
     ) async -> Bool {
         for sample in samples {
             try? await Task.sleep(for: .seconds(sample.delayFromPrevious))
@@ -1785,6 +1811,7 @@ struct LocationSimulationView: View {
                   LocationSimulationSession.shared.isCurrentRoute(routeID) else {
                 return false
             }
+            if let stopWhen, stopWhen() { return true }
 
             let code = await sendLocationUpdate(for: sample.coordinate)
             guard LocationSimulationSession.shared.isCurrentRoute(routeID) else { return false }
@@ -1793,6 +1820,8 @@ struct LocationSimulationView: View {
                 await MainActor.run {
                     routePlaybackTask = nil
                     wanderZoneCenter = nil
+                    wanderGoTarget = nil
+                    wanderGoRequested = nil
                     routePlaybackCoordinate = fallback
                     LocationSimulationSession.shared.clearRoute()
                     if let fallback {
@@ -1866,6 +1895,8 @@ struct LocationSimulationView: View {
                             guard LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
                             routePlaybackTask = nil
                             wanderZoneCenter = nil
+                            wanderGoTarget = nil
+                            wanderGoRequested = nil
                             LocationSimulationSession.shared.clearRoute()
                             if let last {
                                 routePlaybackCoordinate = last
@@ -1895,17 +1926,109 @@ struct LocationSimulationView: View {
                 let finished = await playSamples(
                     Array(scaled.dropFirst()),
                     routeID: routeID,
-                    lastSuccessfulCoordinate: &lastSuccessfulCoordinate
+                    lastSuccessfulCoordinate: &lastSuccessfulCoordinate,
+                    stopWhen: { wanderGoRequested != nil }
                 )
                 guard finished else {
                     prefetch.cancel()
                     return
                 }
-                current = end
+                current = lastSuccessfulCoordinate ?? end
                 heading = newHeading
+
+                if await MainActor.run(body: { wanderGoRequested != nil }) {
+                    prefetch.cancel()
+                    upcoming = nil
+                    let keepGoing = await driveToRequestedPlaces(
+                        routeID: routeID,
+                        speedFactor: speedFactor,
+                        lastSuccessfulCoordinate: &lastSuccessfulCoordinate
+                    )
+                    guard keepGoing else { return }
+                    current = lastSuccessfulCoordinate ?? current
+                    continue
+                }
                 upcoming = await prefetch.value
             }
         }
+    }
+
+    /// Drives to the places the user picks while wandering, ignoring the zone.
+    /// Returns false when the wander task should stop.
+    private func driveToRequestedPlaces(
+        routeID: UUID,
+        speedFactor: Double,
+        lastSuccessfulCoordinate: inout CLLocationCoordinate2D?
+    ) async -> Bool {
+        while true {
+            guard let target = await MainActor.run(body: { wanderGoRequested }) else { return true }
+            await MainActor.run { wanderGoRequested = nil }
+
+            guard LocationSimulationSession.shared.isCurrentRoute(routeID),
+                  let from = lastSuccessfulCoordinate else {
+                return false
+            }
+
+            guard let samples = await goLeg(from: from, to: target), samples.count > 1 else {
+                await MainActor.run {
+                    wanderGoTarget = nil
+                    alertTitle = "Go Here Failed"
+                    alertMessage = "Could not find a driving route to that place. Wandering continues."
+                    showAlert = true
+                }
+                continue
+            }
+
+            let scaled = samples.map {
+                RoutePlaybackSample(
+                    coordinate: $0.coordinate,
+                    delayFromPrevious: $0.delayFromPrevious / speedFactor
+                )
+            }
+            let finished = await playSamples(
+                Array(scaled.dropFirst()),
+                routeID: routeID,
+                lastSuccessfulCoordinate: &lastSuccessfulCoordinate,
+                stopWhen: { wanderGoRequested != nil }
+            )
+            guard finished else { return false }
+
+            await MainActor.run {
+                if wanderGoRequested == nil,
+                   let marker = wanderGoTarget,
+                   marker.latitude == target.latitude,
+                   marker.longitude == target.longitude {
+                    wanderGoTarget = nil
+                }
+            }
+        }
+    }
+
+    private func goLeg(
+        from start: CLLocationCoordinate2D,
+        to destination: CLLocationCoordinate2D
+    ) async -> [RoutePlaybackSample]? {
+        let request = MKDirections.Request()
+        request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
+        request.destination = MKMapItem(placemark: MKPlacemark(coordinate: destination))
+        request.requestsAlternateRoutes = false
+        request.transportType = .automobile
+
+        guard let route = try? await MKDirections(request: request).calculate().routes.first else {
+            return nil
+        }
+        let coordinates = route.polyline.coordinateArray
+        guard coordinates.count > 1 else { return nil }
+
+        let display = sampledRouteCoordinates(
+            from: coordinates,
+            targetDistance: RouteSimulationDefaults.pathSamplingDistance
+        )
+        let fallbackSpeed = route.expectedTravelTime > 0 ? route.distance / route.expectedTravelTime : 13.4
+        return await prefetchRoutePlaybackSamples(
+            displayCoordinates: display,
+            fallbackSpeedMetersPerSecond: fallbackSpeed
+        )
     }
 
     /// Picks a destination ahead of the current heading (so the drive keeps
@@ -1921,13 +2044,15 @@ struct LocationSimulationView: View {
     ) async -> [RoutePlaybackSample]? {
         let centerLocation = CLLocation(latitude: center.latitude, longitude: center.longitude)
         let startLocation = CLLocation(latitude: start.latitude, longitude: start.longitude)
+        // After a manual trip outside the zone, drive back in without the zone limits.
+        let startsOutside = startLocation.distance(from: centerLocation) > radius
 
         for attempt in 0..<10 {
             guard !Task.isCancelled else { return nil }
             let strict = attempt < 7
 
             let destination: CLLocationCoordinate2D
-            if let heading, attempt < 6 {
+            if let heading, !startsOutside, attempt < 6 {
                 let angle = heading + Double.random(in: -100...100)
                 let lower = min(300, radius * 0.4)
                 let upper = max(min(1200, radius * 1.2), 350)
@@ -1959,9 +2084,9 @@ struct LocationSimulationView: View {
                 CLLocation(latitude: point.latitude, longitude: point.longitude)
                     .distance(from: centerLocation) <= radius
             }
-            guard staysInside else { continue }
+            guard staysInside || startsOutside else { continue }
 
-            if strict {
+            if strict && !startsOutside {
                 guard route.distance <= straightDistance * 2.5 + 250 else { continue }
 
                 if let heading {
