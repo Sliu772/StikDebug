@@ -82,6 +82,36 @@ private func reversedPlaybackSamples(_ samples: [RoutePlaybackSample]) -> [Route
     return result
 }
 
+private func offsetCoordinate(
+    from origin: CLLocationCoordinate2D,
+    distance: CLLocationDistance,
+    bearing degrees: Double
+) -> CLLocationCoordinate2D {
+    let radians = degrees * Double.pi / 180
+    let latitudeOffset = distance * cos(radians) / 111_320
+    let longitudeScale = 111_320 * max(cos(origin.latitude * Double.pi / 180), 0.01)
+    let longitudeOffset = distance * sin(radians) / longitudeScale
+    return CLLocationCoordinate2D(
+        latitude: origin.latitude + latitudeOffset,
+        longitude: origin.longitude + longitudeOffset
+    )
+}
+
+private func bearingDegrees(from a: CLLocationCoordinate2D, to b: CLLocationCoordinate2D) -> Double {
+    let lat1 = a.latitude * Double.pi / 180
+    let lat2 = b.latitude * Double.pi / 180
+    let deltaLon = (b.longitude - a.longitude) * Double.pi / 180
+    let y = sin(deltaLon) * cos(lat2)
+    let x = cos(lat1) * sin(lat2) - sin(lat1) * cos(lat2) * cos(deltaLon)
+    let degrees = atan2(y, x) * 180 / Double.pi
+    return (degrees + 360).truncatingRemainder(dividingBy: 360)
+}
+
+private func angularDifference(_ a: Double, _ b: Double) -> Double {
+    let difference = abs(a - b).truncatingRemainder(dividingBy: 360)
+    return difference > 180 ? 360 - difference : difference
+}
+
 private func randomCoordinate(around center: CLLocationCoordinate2D, radius: CLLocationDistance) -> CLLocationCoordinate2D {
     let distance = radius * 0.9 * sqrt(Double.random(in: 0...1))
     let bearing = Double.random(in: 0..<(2 * Double.pi))
@@ -804,6 +834,7 @@ struct LocationSimulationView: View {
     @State private var routeLoopMode: RouteLoopMode = .off
     @State private var wanderMode = false
     @State private var wanderRadius: Double = 500
+    @State private var wanderSpeedFactor: Double = 1.0
     @State private var wanderZoneCenter: CLLocationCoordinate2D?
 
     private static let routeDurationFormatter: DateComponentsFormatter = {
@@ -1370,6 +1401,16 @@ struct LocationSimulationView: View {
 
                     Slider(value: $wanderRadius, in: 200...5000, step: 100)
 
+                    HStack {
+                        Text("Speed")
+                        Spacer()
+                        Text("\(Int(wanderSpeedFactor * 100))%")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                    Slider(value: $wanderSpeedFactor, in: 0.5...1.5, step: 0.1)
+
                     Button("Start Wander", action: startWander)
                         .buttonStyle(.borderedProminent)
                         .disabled(!pairingExists || isBusy || isRouteRunning)
@@ -1778,6 +1819,7 @@ struct LocationSimulationView: View {
     private func startWander() {
         guard pairingExists, !isBusy, let center = coordinate else { return }
         let radius = wanderRadius
+        let speedFactor = wanderSpeedFactor
         stopResendLoop()
         cancelRoutePlayback(resetMarker: false)
         runLocationCommand(
@@ -1792,22 +1834,28 @@ struct LocationSimulationView: View {
             simulatedCoordinate = nil
             routePlaybackCoordinate = center
             wanderZoneCenter = center
-            startWanderPlayback(routeID: routeID, center: center, radius: radius)
+            startWanderPlayback(routeID: routeID, center: center, radius: radius, speedFactor: speedFactor)
         }
     }
 
-    private func startWanderPlayback(routeID: UUID, center: CLLocationCoordinate2D, radius: CLLocationDistance) {
+    private func startWanderPlayback(
+        routeID: UUID,
+        center: CLLocationCoordinate2D,
+        radius: CLLocationDistance,
+        speedFactor: Double
+    ) {
         routePlaybackTask = Task {
             var lastSuccessfulCoordinate: CLLocationCoordinate2D? = center
             var current = center
             var upcoming: [RoutePlaybackSample]?
+            var heading: CLLocationDirection?
             var emptyRounds = 0
 
             while !Task.isCancelled, LocationSimulationSession.shared.isCurrentRoute(routeID) {
                 var leg = upcoming
                 upcoming = nil
                 if leg == nil {
-                    leg = await wanderLeg(from: current, center: center, radius: radius)
+                    leg = await wanderLeg(from: current, center: center, radius: radius, heading: heading)
                 }
 
                 guard let samples = leg, samples.count > 1 else {
@@ -1835,10 +1883,17 @@ struct LocationSimulationView: View {
                 emptyRounds = 0
 
                 let end = samples[samples.count - 1].coordinate
+                let newHeading = bearingDegrees(from: samples[samples.count - 2].coordinate, to: end)
                 // Compute the next leg while this one is playing.
-                let prefetch = Task { await wanderLeg(from: end, center: center, radius: radius) }
+                let prefetch = Task { await wanderLeg(from: end, center: center, radius: radius, heading: newHeading) }
+                let scaled = samples.map {
+                    RoutePlaybackSample(
+                        coordinate: $0.coordinate,
+                        delayFromPrevious: $0.delayFromPrevious / speedFactor
+                    )
+                }
                 let finished = await playSamples(
-                    Array(samples.dropFirst()),
+                    Array(scaled.dropFirst()),
                     routeID: routeID,
                     lastSuccessfulCoordinate: &lastSuccessfulCoordinate
                 )
@@ -1847,26 +1902,44 @@ struct LocationSimulationView: View {
                     return
                 }
                 current = end
+                heading = newHeading
                 upcoming = await prefetch.value
             }
         }
     }
 
-    /// Picks random destinations inside the zone until MapKit returns a driving
-    /// route whose whole path stays inside it.
+    /// Picks a destination ahead of the current heading (so the drive keeps
+    /// flowing instead of zig-zagging) and asks MapKit for a driving route,
+    /// which respects one-way streets. Routes that leave the zone, start with
+    /// a U-turn or take a big detour are discarded. Speeds come from the same
+    /// OpenStreetMap speed-limit lookup that "Play Route" uses.
     private func wanderLeg(
         from start: CLLocationCoordinate2D,
         center: CLLocationCoordinate2D,
-        radius: CLLocationDistance
+        radius: CLLocationDistance,
+        heading: CLLocationDirection?
     ) async -> [RoutePlaybackSample]? {
         let centerLocation = CLLocation(latitude: center.latitude, longitude: center.longitude)
         let startLocation = CLLocation(latitude: start.latitude, longitude: start.longitude)
 
-        for _ in 0..<8 {
+        for attempt in 0..<10 {
             guard !Task.isCancelled else { return nil }
-            let destination = randomCoordinate(around: center, radius: radius)
+            let strict = attempt < 7
+
+            let destination: CLLocationCoordinate2D
+            if let heading, attempt < 6 {
+                let angle = heading + Double.random(in: -100...100)
+                let lower = min(300, radius * 0.4)
+                let upper = max(min(1200, radius * 1.2), 350)
+                destination = offsetCoordinate(from: start, distance: Double.random(in: lower...upper), bearing: angle)
+            } else {
+                destination = randomCoordinate(around: center, radius: radius)
+            }
+
             let destinationLocation = CLLocation(latitude: destination.latitude, longitude: destination.longitude)
-            guard destinationLocation.distance(from: startLocation) >= min(150, radius / 2) else { continue }
+            guard destinationLocation.distance(from: centerLocation) <= radius * 0.95 else { continue }
+            let straightDistance = destinationLocation.distance(from: startLocation)
+            guard straightDistance >= min(150, radius / 2) else { continue }
 
             let request = MKDirections.Request()
             request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
@@ -1881,21 +1954,36 @@ struct LocationSimulationView: View {
 
             let coordinates = route.polyline.coordinateArray
             guard coordinates.count > 1 else { continue }
+
             let staysInside = coordinates.allSatisfy { point in
                 CLLocation(latitude: point.latitude, longitude: point.longitude)
                     .distance(from: centerLocation) <= radius
             }
             guard staysInside else { continue }
 
+            if strict {
+                guard route.distance <= straightDistance * 2.5 + 250 else { continue }
+
+                if let heading {
+                    let origin = CLLocation(latitude: coordinates[0].latitude, longitude: coordinates[0].longitude)
+                    let reference = coordinates.dropFirst().first { point in
+                        CLLocation(latitude: point.latitude, longitude: point.longitude).distance(from: origin) > 15
+                    }
+                    if let reference {
+                        let routeHeading = bearingDegrees(from: coordinates[0], to: reference)
+                        if angularDifference(routeHeading, heading) > 120 { continue }
+                    }
+                }
+            }
+
             let display = sampledRouteCoordinates(
                 from: coordinates,
                 targetDistance: RouteSimulationDefaults.pathSamplingDistance
             )
-            let speed = route.expectedTravelTime > 0 ? route.distance / route.expectedTravelTime : 13.4
-            let samples = buildPlaybackSamples(
-                from: display,
-                speedWays: [],
-                fallbackSpeedMetersPerSecond: speed
+            let fallbackSpeed = route.expectedTravelTime > 0 ? route.distance / route.expectedTravelTime : 13.4
+            let samples = await prefetchRoutePlaybackSamples(
+                displayCoordinates: display,
+                fallbackSpeedMetersPerSecond: fallbackSpeed
             )
             if samples.count > 1 { return samples }
         }
