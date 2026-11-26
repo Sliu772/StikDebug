@@ -52,6 +52,48 @@ private struct RoutePlaybackSample {
     let delayFromPrevious: TimeInterval
 }
 
+private enum RouteLoopMode: String, CaseIterable, Identifiable {
+    case off
+    case circular
+    case pingPong
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .off: return "Once"
+        case .circular: return "Loop"
+        case .pingPong: return "Back & forth"
+        }
+    }
+}
+
+/// Reverses a playback path. Each sample stores the delay from its previous
+/// sample, so the delays are shifted to stay attached to the same segment.
+private func reversedPlaybackSamples(_ samples: [RoutePlaybackSample]) -> [RoutePlaybackSample] {
+    guard samples.count > 1 else { return samples }
+    let last = samples.count - 1
+    var result: [RoutePlaybackSample] = []
+    for k in 0...last {
+        let index = last - k
+        let delay = k == 0 ? 0 : samples[index + 1].delayFromPrevious
+        result.append(RoutePlaybackSample(coordinate: samples[index].coordinate, delayFromPrevious: delay))
+    }
+    return result
+}
+
+private func randomCoordinate(around center: CLLocationCoordinate2D, radius: CLLocationDistance) -> CLLocationCoordinate2D {
+    let distance = radius * 0.9 * sqrt(Double.random(in: 0...1))
+    let bearing = Double.random(in: 0..<(2 * Double.pi))
+    let latitudeOffset = distance * cos(bearing) / 111_320
+    let longitudeScale = 111_320 * max(cos(center.latitude * Double.pi / 180), 0.01)
+    let longitudeOffset = distance * sin(bearing) / longitudeScale
+    return CLLocationCoordinate2D(
+        latitude: center.latitude + latitudeOffset,
+        longitude: center.longitude + longitudeOffset
+    )
+}
+
 private struct OpenStreetMapWay {
     let geometry: [CLLocationCoordinate2D]
     let speedLimitMetersPerSecond: CLLocationSpeed
@@ -759,6 +801,10 @@ struct LocationSimulationView: View {
     @State private var routePlaybackCoordinate: CLLocationCoordinate2D?
     @State private var simulatedCoordinate: CLLocationCoordinate2D?
     @State private var routeRequestID = UUID()
+    @State private var routeLoopMode: RouteLoopMode = .off
+    @State private var wanderMode = false
+    @State private var wanderRadius: Double = 500
+    @State private var wanderZoneCenter: CLLocationCoordinate2D?
 
     private static let routeDurationFormatter: DateComponentsFormatter = {
         let formatter = DateComponentsFormatter()
@@ -814,6 +860,10 @@ struct LocationSimulationView: View {
 
     private var displayedRouteCoordinate: CLLocationCoordinate2D? {
         simulationSession.routeCoordinates == nil ? routePlaybackCoordinate : simulationSession.coordinate
+    }
+
+    private var wanderCircleCenter: CLLocationCoordinate2D? {
+        wanderZoneCenter ?? (wanderMode ? coordinate : nil)
     }
 
     private var routeSummaryText: String? {
@@ -894,6 +944,11 @@ struct LocationSimulationView: View {
         ZStack(alignment: .bottom) {
             MapReader { proxy in
                 Map(position: $position) {
+                    if let circleCenter = wanderCircleCenter {
+                        MapCircle(center: circleCenter, radius: wanderRadius)
+                            .foregroundStyle(.blue.opacity(0.12))
+                            .stroke(.blue, lineWidth: 2)
+                    }
                     if hasRouteContext {
                         if let routePolyline {
                             MapPolyline(routePolyline)
@@ -1299,6 +1354,27 @@ struct LocationSimulationView: View {
                 .tint(.blue)
                 .disabled(isRouteRunning)
             }
+
+            Toggle("Wander in zone", isOn: $wanderMode)
+                .disabled(isRouteRunning)
+
+            if wanderMode {
+                VStack(spacing: 6) {
+                    HStack {
+                        Text("Zone radius")
+                        Spacer()
+                        Text("\(Int(wanderRadius)) m")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                    Slider(value: $wanderRadius, in: 200...5000, step: 100)
+
+                    Button("Start Wander", action: startWander)
+                        .buttonStyle(.borderedProminent)
+                        .disabled(!pairingExists || isBusy || isRouteRunning)
+                }
+            }
         } else {
             Text("Tap map to drop pin")
                 .font(.subheadline)
@@ -1322,6 +1398,15 @@ struct LocationSimulationView: View {
             }
 
             routeAttributionLink
+
+            if wanderZoneCenter == nil {
+                Picker("Repeat", selection: $routeLoopMode) {
+                    ForEach(RouteLoopMode.allCases) { mode in
+                        Text(mode.title).tag(mode)
+                    }
+                }
+                .pickerStyle(.segmented)
+            }
 
             HStack(spacing: 12) {
                 Button("Stop", action: clear)
@@ -1423,6 +1508,7 @@ struct LocationSimulationView: View {
         routeSpeedPrefetchTask = nil
         cancelRoutePlayback(resetMarker: true)
         stopResendLoop()
+        wanderZoneCenter = nil
         LocationSimulationSession.shared.clearRoute()
         runLocationCommand(
             errorTitle: "Clear Failed",
@@ -1587,39 +1673,47 @@ struct LocationSimulationView: View {
     }
 
     private func startRoutePlayback(routeID: UUID) {
+        let original = routePlaybackSamples
+        guard !original.isEmpty else { return }
         routePlaybackTask = Task {
-            var lastSuccessfulCoordinate = routePlaybackSamples.first?.coordinate
+            var lastSuccessfulCoordinate: CLLocationCoordinate2D? = original.first?.coordinate
+            var forward = true
+            var path = original
 
-            for sample in routePlaybackSamples.dropFirst() {
-                try? await Task.sleep(for: .seconds(sample.delayFromPrevious))
-                guard !Task.isCancelled,
+            while true {
+                let finished = await playSamples(
+                    Array(path.dropFirst()),
+                    routeID: routeID,
+                    lastSuccessfulCoordinate: &lastSuccessfulCoordinate
+                )
+                guard finished else { return }
+
+                let mode = await MainActor.run { routeLoopMode }
+                guard mode != .off,
+                      !Task.isCancelled,
                       LocationSimulationSession.shared.isCurrentRoute(routeID) else {
-                    return
+                    break
                 }
 
-                let code = await sendLocationUpdate(for: sample.coordinate)
-                guard LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
-                guard code == 0 else {
-                    await MainActor.run {
-                        routePlaybackTask = nil
-                        routePlaybackCoordinate = lastSuccessfulCoordinate
-                        LocationSimulationSession.shared.clearRoute()
-                        if let lastSuccessfulCoordinate {
-                            startResendLoop(with: lastSuccessfulCoordinate)
-                        }
-                        alertTitle = "Route Simulation Failed"
-                        alertMessage = "Could not continue route simulation (error \(code))."
-                        connectionErrorMessage = "Code \(code): Could not continue route simulation."
-                        locationConnectionNotice = nil
-                        showAlert = true
-                    }
-                    return
-                }
-
-                lastSuccessfulCoordinate = sample.coordinate
-                await MainActor.run {
-                    routePlaybackCoordinate = sample.coordinate
-                    LocationSimulationSession.shared.updateCoordinate(sample.coordinate)
+                switch mode {
+                case .pingPong:
+                    forward.toggle()
+                    path = forward ? original : reversedPlaybackSamples(original)
+                case .circular:
+                    forward = true
+                    // Jump from the end back to the start, then replay the route.
+                    var restart = original
+                    restart[0] = RoutePlaybackSample(
+                        coordinate: original[0].coordinate,
+                        delayFromPrevious: RouteSimulationDefaults.playbackTickInterval
+                    )
+                    let here = RoutePlaybackSample(
+                        coordinate: lastSuccessfulCoordinate ?? original[0].coordinate,
+                        delayFromPrevious: 0
+                    )
+                    path = [here] + restart
+                case .off:
+                    break
                 }
             }
 
@@ -1635,6 +1729,177 @@ struct LocationSimulationView: View {
                 }
             }
         }
+    }
+
+    /// Plays every given sample in order. Returns false if playback was
+    /// cancelled, replaced or failed (the failure alert is shown here).
+    private func playSamples(
+        _ samples: [RoutePlaybackSample],
+        routeID: UUID,
+        lastSuccessfulCoordinate: inout CLLocationCoordinate2D?
+    ) async -> Bool {
+        for sample in samples {
+            try? await Task.sleep(for: .seconds(sample.delayFromPrevious))
+            guard !Task.isCancelled,
+                  LocationSimulationSession.shared.isCurrentRoute(routeID) else {
+                return false
+            }
+
+            let code = await sendLocationUpdate(for: sample.coordinate)
+            guard LocationSimulationSession.shared.isCurrentRoute(routeID) else { return false }
+            guard code == 0 else {
+                let fallback = lastSuccessfulCoordinate
+                await MainActor.run {
+                    routePlaybackTask = nil
+                    wanderZoneCenter = nil
+                    routePlaybackCoordinate = fallback
+                    LocationSimulationSession.shared.clearRoute()
+                    if let fallback {
+                        startResendLoop(with: fallback)
+                    }
+                    alertTitle = "Route Simulation Failed"
+                    alertMessage = "Could not continue route simulation (error \(code))."
+                    connectionErrorMessage = "Code \(code): Could not continue route simulation."
+                    locationConnectionNotice = nil
+                    showAlert = true
+                }
+                return false
+            }
+
+            lastSuccessfulCoordinate = sample.coordinate
+            await MainActor.run {
+                routePlaybackCoordinate = sample.coordinate
+                LocationSimulationSession.shared.updateCoordinate(sample.coordinate)
+            }
+        }
+        return true
+    }
+
+    private func startWander() {
+        guard pairingExists, !isBusy, let center = coordinate else { return }
+        let radius = wanderRadius
+        stopResendLoop()
+        cancelRoutePlayback(resetMarker: false)
+        runLocationCommand(
+            errorTitle: "Wander Failed",
+            errorMessage: { code in
+                "Could not start wander simulation (error \(code)). Make sure the device is connected and the DDI is mounted."
+            },
+            operation: { locationUpdateCode(for: center) }
+        ) {
+            beginBackgroundTask()
+            let routeID = LocationSimulationSession.shared.startRoute(at: center, coordinates: [center])
+            simulatedCoordinate = nil
+            routePlaybackCoordinate = center
+            wanderZoneCenter = center
+            startWanderPlayback(routeID: routeID, center: center, radius: radius)
+        }
+    }
+
+    private func startWanderPlayback(routeID: UUID, center: CLLocationCoordinate2D, radius: CLLocationDistance) {
+        routePlaybackTask = Task {
+            var lastSuccessfulCoordinate: CLLocationCoordinate2D? = center
+            var current = center
+            var upcoming: [RoutePlaybackSample]?
+            var emptyRounds = 0
+
+            while !Task.isCancelled, LocationSimulationSession.shared.isCurrentRoute(routeID) {
+                var leg = upcoming
+                upcoming = nil
+                if leg == nil {
+                    leg = await wanderLeg(from: current, center: center, radius: radius)
+                }
+
+                guard let samples = leg, samples.count > 1 else {
+                    emptyRounds += 1
+                    if emptyRounds >= 4 {
+                        let last = lastSuccessfulCoordinate
+                        await MainActor.run {
+                            guard LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
+                            routePlaybackTask = nil
+                            wanderZoneCenter = nil
+                            LocationSimulationSession.shared.clearRoute()
+                            if let last {
+                                routePlaybackCoordinate = last
+                                startResendLoop(with: last)
+                            }
+                            alertTitle = "Wander Stopped"
+                            alertMessage = "Could not find a route that stays inside the zone. Try a larger radius or a spot with more streets."
+                            showAlert = true
+                        }
+                        return
+                    }
+                    try? await Task.sleep(for: .seconds(3))
+                    continue
+                }
+                emptyRounds = 0
+
+                let end = samples[samples.count - 1].coordinate
+                // Compute the next leg while this one is playing.
+                let prefetch = Task { await wanderLeg(from: end, center: center, radius: radius) }
+                let finished = await playSamples(
+                    Array(samples.dropFirst()),
+                    routeID: routeID,
+                    lastSuccessfulCoordinate: &lastSuccessfulCoordinate
+                )
+                guard finished else {
+                    prefetch.cancel()
+                    return
+                }
+                current = end
+                upcoming = await prefetch.value
+            }
+        }
+    }
+
+    /// Picks random destinations inside the zone until MapKit returns a driving
+    /// route whose whole path stays inside it.
+    private func wanderLeg(
+        from start: CLLocationCoordinate2D,
+        center: CLLocationCoordinate2D,
+        radius: CLLocationDistance
+    ) async -> [RoutePlaybackSample]? {
+        let centerLocation = CLLocation(latitude: center.latitude, longitude: center.longitude)
+        let startLocation = CLLocation(latitude: start.latitude, longitude: start.longitude)
+
+        for _ in 0..<8 {
+            guard !Task.isCancelled else { return nil }
+            let destination = randomCoordinate(around: center, radius: radius)
+            let destinationLocation = CLLocation(latitude: destination.latitude, longitude: destination.longitude)
+            guard destinationLocation.distance(from: startLocation) >= min(150, radius / 2) else { continue }
+
+            let request = MKDirections.Request()
+            request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
+            request.destination = MKMapItem(placemark: MKPlacemark(coordinate: destination))
+            request.requestsAlternateRoutes = false
+            request.transportType = .automobile
+
+            guard let route = try? await MKDirections(request: request).calculate().routes.first else {
+                try? await Task.sleep(for: .seconds(1))
+                continue
+            }
+
+            let coordinates = route.polyline.coordinateArray
+            guard coordinates.count > 1 else { continue }
+            let staysInside = coordinates.allSatisfy { point in
+                CLLocation(latitude: point.latitude, longitude: point.longitude)
+                    .distance(from: centerLocation) <= radius
+            }
+            guard staysInside else { continue }
+
+            let display = sampledRouteCoordinates(
+                from: coordinates,
+                targetDistance: RouteSimulationDefaults.pathSamplingDistance
+            )
+            let speed = route.expectedTravelTime > 0 ? route.distance / route.expectedTravelTime : 13.4
+            let samples = buildPlaybackSamples(
+                from: display,
+                speedWays: [],
+                fallbackSpeedMetersPerSecond: speed
+            )
+            if samples.count > 1 { return samples }
+        }
+        return nil
     }
 
     private func sendLocationUpdate(for coordinate: CLLocationCoordinate2D) async -> Int32 {
