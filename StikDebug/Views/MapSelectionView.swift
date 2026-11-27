@@ -156,11 +156,30 @@ private struct WanderZone: Codable, Identifiable, Equatable {
 
 private enum WanderTransport: String, CaseIterable, Identifiable {
     case driving
+    case moto
     case walking
 
     var id: String { rawValue }
-    var title: String { self == .driving ? "Car" : "Walk" }
-    var mapKitType: MKDirectionsTransportType { self == .driving ? .automobile : .walking }
+
+    var title: String {
+        switch self {
+        case .driving: return "Car"
+        case .moto: return "Moto"
+        case .walking: return "Walk"
+        }
+    }
+
+    var mapKitType: MKDirectionsTransportType { self == .walking ? .walking : .automobile }
+}
+
+/// Travel mode plus the settings that depend on it.
+private struct WanderTravel {
+    let mode: WanderTransport
+    let topSpeed: CLLocationSpeed // m/s, used by Moto: always rides at this speed
+
+    var mapKitType: MKDirectionsTransportType { mode.mapKitType }
+    var stopSpacing: ClosedRange<Double> { mode == .moto ? 700...1800 : 250...700 }
+    var reach: Double { mode == .moto ? 3 : 1 }
 }
 
 private enum WanderZoneKind: String, CaseIterable, Identifiable {
@@ -257,7 +276,8 @@ private enum WanderZoneStore {
 private func humanizedSamples(
     _ samples: [RoutePlaybackSample],
     speedFactor: Double,
-    humanize: Bool
+    humanize: Bool,
+    stopSpacing: ClosedRange<Double> = 250...700
 ) -> [RoutePlaybackSample] {
     guard samples.count > 1 else { return samples }
     guard humanize else {
@@ -288,7 +308,7 @@ private func humanizedSamples(
 
     var wobble = 1.0
     var sinceStop = 0.0
-    var nextStop = Double.random(in: 250...700)
+    var nextStop = Double.random(in: stopSpacing)
     var result: [RoutePlaybackSample] = []
     for (index, sample) in samples.enumerated() {
         wobble = min(1.1, max(0.9, wobble + Double.random(in: -0.02...0.02)))
@@ -298,7 +318,7 @@ private func humanizedSamples(
             if sinceStop >= nextStop {
                 delay += Double.random(in: 4...12)
                 sinceStop = 0
-                nextStop = Double.random(in: 250...700)
+                nextStop = Double.random(in: stopSpacing)
             }
         }
         result.append(RoutePlaybackSample(coordinate: sample.coordinate, delayFromPrevious: delay))
@@ -1062,6 +1082,7 @@ struct LocationSimulationView: View {
     @State private var wanderGoPoints: [CLLocationCoordinate2D] = []
     @State private var wanderGoRequested: [CLLocationCoordinate2D]?
     @State private var wanderTransport: WanderTransport = .driving
+    @State private var wanderTopSpeedKmh: Double = 80
     @State private var wanderZoneKind: WanderZoneKind = .circle
     @State private var wanderPolygon: [CLLocationCoordinate2D] = []
     @State private var wanderActivePolygon: [CLLocationCoordinate2D] = []
@@ -1679,6 +1700,18 @@ struct LocationSimulationView: View {
                     }
                     .pickerStyle(.segmented)
 
+                    if wanderTransport == .moto {
+                        HStack {
+                            Text("Top speed")
+                            Spacer()
+                            Text("\(Int(wanderTopSpeedKmh)) km/h")
+                        }
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                        Slider(value: $wanderTopSpeedKmh, in: 30...120, step: 5)
+                    }
+
                     if wanderZoneKind == .circle {
                         HStack {
                             Text("Zone radius")
@@ -2290,7 +2323,7 @@ struct LocationSimulationView: View {
         let travelFromHere = wanderTravelFromHere
         let speedFactor = wanderSpeedFactor
         let humanize = wanderHumanize
-        let transport = wanderTransport
+        let transport = WanderTravel(mode: wanderTransport, topSpeed: wanderTopSpeedKmh / 3.6)
 
         wanderStarting = true
         Task {
@@ -2340,7 +2373,7 @@ struct LocationSimulationView: View {
         origin: CLLocationCoordinate2D?,
         speedFactor: Double,
         humanize: Bool,
-        transport: WanderTransport
+        transport: WanderTravel
     ) {
         let plan = wanderApproachPlan(origin: origin, start: start)
         let first = plan.first
@@ -2387,7 +2420,7 @@ struct LocationSimulationView: View {
         approachTo: CLLocationCoordinate2D?,
         speedFactor: Double,
         humanize: Bool,
-        transport: WanderTransport
+        transport: WanderTravel
     ) {
         routePlaybackTask = Task {
             var lastSuccessfulCoordinate: CLLocationCoordinate2D? = start
@@ -2399,7 +2432,7 @@ struct LocationSimulationView: View {
             // First travel from where the phone is to the zone, then start wandering.
             if let target = approachTo {
                 if let approach = await goLeg(from: start, to: target, transport: transport), approach.count > 1 {
-                    let scaled = humanizedSamples(approach, speedFactor: speedFactor, humanize: humanize)
+                    let scaled = humanizedSamples(approach, speedFactor: speedFactor, humanize: humanize, stopSpacing: transport.stopSpacing)
                     let arrived = await playSamples(
                         Array(scaled.dropFirst()),
                         routeID: routeID,
@@ -2478,7 +2511,7 @@ struct LocationSimulationView: View {
                 let prefetch = Task {
                     await wanderLeg(from: end, zone: zone, heading: newHeading, transport: transport)
                 }
-                let scaled = humanizedSamples(samples, speedFactor: speedFactor, humanize: humanize)
+                let scaled = humanizedSamples(samples, speedFactor: speedFactor, humanize: humanize, stopSpacing: transport.stopSpacing)
                 let finished = await playSamples(
                     Array(scaled.dropFirst()),
                     routeID: routeID,
@@ -2535,7 +2568,7 @@ struct LocationSimulationView: View {
         routeID: UUID,
         speedFactor: Double,
         humanize: Bool,
-        transport: WanderTransport,
+        transport: WanderTravel,
         lastSuccessfulCoordinate: inout CLLocationCoordinate2D?
     ) async -> Bool {
         while true {
@@ -2559,7 +2592,7 @@ struct LocationSimulationView: View {
                     continue
                 }
 
-                let scaled = humanizedSamples(samples, speedFactor: speedFactor, humanize: humanize)
+                let scaled = humanizedSamples(samples, speedFactor: speedFactor, humanize: humanize, stopSpacing: transport.stopSpacing)
                 let finished = await playSamples(
                     Array(scaled.dropFirst()),
                     routeID: routeID,
@@ -2630,7 +2663,7 @@ struct LocationSimulationView: View {
 
     private func routeSamples(
         for route: MKRoute,
-        transport: WanderTransport
+        transport: WanderTravel
     ) async -> [RoutePlaybackSample] {
         let coordinates = route.polyline.coordinateArray
         let display = sampledRouteCoordinates(
@@ -2638,24 +2671,33 @@ struct LocationSimulationView: View {
             targetDistance: RouteSimulationDefaults.pathSamplingDistance
         )
         let fallbackSpeed = route.expectedTravelTime > 0 ? route.distance / route.expectedTravelTime : 13.4
-        if transport == .driving {
+        switch transport.mode {
+        case .driving:
             // Same speed-limit lookup as "Play Route".
             return await prefetchRoutePlaybackSamples(
                 displayCoordinates: display,
                 fallbackSpeedMetersPerSecond: fallbackSpeed
             )
+        case .moto:
+            // Always at the chosen top speed, ignoring speed limits.
+            return buildPlaybackSamples(
+                from: display,
+                speedWays: [],
+                fallbackSpeedMetersPerSecond: transport.topSpeed
+            )
+        case .walking:
+            return buildPlaybackSamples(
+                from: display,
+                speedWays: [],
+                fallbackSpeedMetersPerSecond: fallbackSpeed
+            )
         }
-        return buildPlaybackSamples(
-            from: display,
-            speedWays: [],
-            fallbackSpeedMetersPerSecond: fallbackSpeed
-        )
     }
 
     private func goLeg(
         from start: CLLocationCoordinate2D,
         to destination: CLLocationCoordinate2D,
-        transport: WanderTransport
+        transport: WanderTravel
     ) async -> [RoutePlaybackSample]? {
         let request = MKDirections.Request()
         request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
@@ -2678,7 +2720,7 @@ struct LocationSimulationView: View {
         from start: CLLocationCoordinate2D,
         zone: WanderZoneShape,
         heading: CLLocationDirection?,
-        transport: WanderTransport
+        transport: WanderTravel
     ) async -> [RoutePlaybackSample]? {
         let startLocation = CLLocation(latitude: start.latitude, longitude: start.longitude)
         // After a manual trip outside the zone, come back in without the zone limits.
@@ -2692,8 +2734,8 @@ struct LocationSimulationView: View {
             let destination: CLLocationCoordinate2D
             if let heading, !startsOutside, attempt < 6 {
                 let angle = heading + Double.random(in: -100...100)
-                let lower = min(300, radius * 0.4)
-                let upper = max(min(1200, radius * 1.2), 350)
+                let lower = min(300 * transport.reach, radius * 0.4)
+                let upper = max(min(1200 * transport.reach, radius * 1.2), 350)
                 destination = offsetCoordinate(from: start, distance: Double.random(in: lower...upper), bearing: angle)
             } else {
                 destination = zone.randomPoint()
