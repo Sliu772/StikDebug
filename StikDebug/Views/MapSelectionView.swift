@@ -82,6 +82,230 @@ private func reversedPlaybackSamples(_ samples: [RoutePlaybackSample]) -> [Route
     return result
 }
 
+/// One-shot read of where the phone currently is (needs the location permission
+/// the app already asks for). Returns nil when denied or if it takes too long.
+@MainActor
+private final class OneShotLocationProvider: NSObject, CLLocationManagerDelegate {
+    private let manager = CLLocationManager()
+    private var continuation: CheckedContinuation<CLLocationCoordinate2D?, Never>?
+
+    override init() {
+        super.init()
+        manager.delegate = self
+        manager.desiredAccuracy = kCLLocationAccuracyBest
+    }
+
+    func current() async -> CLLocationCoordinate2D? {
+        switch manager.authorizationStatus {
+        case .authorizedAlways, .authorizedWhenInUse:
+            break
+        default:
+            return nil
+        }
+        return await withCheckedContinuation { (continuation: CheckedContinuation<CLLocationCoordinate2D?, Never>) in
+            self.continuation = continuation
+            manager.requestLocation()
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(8))
+                self.finish(nil)
+            }
+        }
+    }
+
+    private func finish(_ coordinate: CLLocationCoordinate2D?) {
+        continuation?.resume(returning: coordinate)
+        continuation = nil
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didUpdateLocations locations: [CLLocation]) {
+        let coordinate = locations.last?.coordinate
+        Task { @MainActor in self.finish(coordinate) }
+    }
+
+    nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
+        Task { @MainActor in self.finish(nil) }
+    }
+}
+
+private struct WanderPoint: Codable, Equatable {
+    var latitude: Double
+    var longitude: Double
+
+    init(_ coordinate: CLLocationCoordinate2D) {
+        latitude = coordinate.latitude
+        longitude = coordinate.longitude
+    }
+
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
+}
+
+private struct WanderZone: Codable, Identifiable, Equatable {
+    var id = UUID()
+    var name: String
+    var latitude: Double
+    var longitude: Double
+    var radius: Double
+    var polygon: [WanderPoint]?
+
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
+}
+
+private enum WanderTransport: String, CaseIterable, Identifiable {
+    case driving
+    case walking
+
+    var id: String { rawValue }
+    var title: String { self == .driving ? "Car" : "Walk" }
+    var mapKitType: MKDirectionsTransportType { self == .driving ? .automobile : .walking }
+}
+
+private enum WanderZoneKind: String, CaseIterable, Identifiable {
+    case circle
+    case polygon
+
+    var id: String { rawValue }
+    var title: String { self == .circle ? "Circle" : "Polygon" }
+}
+
+/// The area the wander stays in: a circle, or a polygon when `polygon` has 3+ corners.
+private struct WanderZoneShape {
+    let center: CLLocationCoordinate2D
+    let radius: CLLocationDistance
+    let polygon: [CLLocationCoordinate2D]
+
+    init(center: CLLocationCoordinate2D, radius: CLLocationDistance) {
+        self.center = center
+        self.radius = radius
+        self.polygon = []
+    }
+
+    init(polygon: [CLLocationCoordinate2D]) {
+        let count = Double(max(polygon.count, 1))
+        let latitude = polygon.map { $0.latitude }.reduce(0, +) / count
+        let longitude = polygon.map { $0.longitude }.reduce(0, +) / count
+        let centroid = CLLocation(latitude: latitude, longitude: longitude)
+        let farthest = polygon
+            .map { CLLocation(latitude: $0.latitude, longitude: $0.longitude).distance(from: centroid) }
+            .max() ?? 200
+        self.center = CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+        self.radius = max(farthest, 100)
+        self.polygon = polygon
+    }
+
+    func contains(_ point: CLLocationCoordinate2D) -> Bool {
+        guard polygon.count >= 3 else {
+            return CLLocation(latitude: point.latitude, longitude: point.longitude)
+                .distance(from: CLLocation(latitude: center.latitude, longitude: center.longitude)) <= radius
+        }
+        var inside = false
+        var j = polygon.count - 1
+        for i in 0..<polygon.count {
+            let a = polygon[i]
+            let b = polygon[j]
+            if (a.latitude > point.latitude) != (b.latitude > point.latitude) {
+                let crossing = (b.longitude - a.longitude) * (point.latitude - a.latitude)
+                    / (b.latitude - a.latitude) + a.longitude
+                if point.longitude < crossing { inside.toggle() }
+            }
+            j = i
+        }
+        return inside
+    }
+
+    func randomPoint() -> CLLocationCoordinate2D {
+        guard polygon.count >= 3 else { return randomCoordinate(around: center, radius: radius) }
+        let latitudes = polygon.map { $0.latitude }
+        let longitudes = polygon.map { $0.longitude }
+        guard let minLat = latitudes.min(), let maxLat = latitudes.max(),
+              let minLon = longitudes.min(), let maxLon = longitudes.max() else { return center }
+        for _ in 0..<60 {
+            let point = CLLocationCoordinate2D(
+                latitude: Double.random(in: minLat...maxLat),
+                longitude: Double.random(in: minLon...maxLon)
+            )
+            if contains(point) { return point }
+        }
+        return center
+    }
+}
+
+private enum WanderZoneStore {
+    static let key = "wanderZones"
+
+    static func load() -> [WanderZone] {
+        guard let data = UserDefaults.standard.data(forKey: key),
+              let zones = try? JSONDecoder().decode([WanderZone].self, from: data) else {
+            return []
+        }
+        return zones
+    }
+
+    static func save(_ zones: [WanderZone]) {
+        if let data = try? JSONEncoder().encode(zones) {
+            UserDefaults.standard.set(data, forKey: key)
+        }
+    }
+}
+
+/// Applies the speed factor and, when `humanize` is on, makes the drive feel
+/// less robotic: slower around corners, a slowly drifting speed (+-10%) and
+/// short stops every few hundred meters (like traffic lights).
+private func humanizedSamples(
+    _ samples: [RoutePlaybackSample],
+    speedFactor: Double,
+    humanize: Bool
+) -> [RoutePlaybackSample] {
+    guard samples.count > 1 else { return samples }
+    guard humanize else {
+        return samples.map {
+            RoutePlaybackSample(coordinate: $0.coordinate, delayFromPrevious: $0.delayFromPrevious / speedFactor)
+        }
+    }
+
+    func meters(_ a: CLLocationCoordinate2D, _ b: CLLocationCoordinate2D) -> Double {
+        CLLocation(latitude: a.latitude, longitude: a.longitude)
+            .distance(from: CLLocation(latitude: b.latitude, longitude: b.longitude))
+    }
+
+    var slow = [Double](repeating: 1, count: samples.count)
+    if samples.count > 2 {
+        for i in 1..<(samples.count - 1) {
+            let a = samples[i - 1].coordinate
+            let b = samples[i].coordinate
+            let c = samples[i + 1].coordinate
+            guard meters(a, b) >= 1, meters(b, c) >= 1 else { continue }
+            if angularDifference(bearingDegrees(from: a, to: b), bearingDegrees(from: b, to: c)) > 30 {
+                for j in max(0, i - 2)...min(samples.count - 1, i + 2) {
+                    slow[j] = max(slow[j], 1.6)
+                }
+            }
+        }
+    }
+
+    var wobble = 1.0
+    var sinceStop = 0.0
+    var nextStop = Double.random(in: 250...700)
+    var result: [RoutePlaybackSample] = []
+    for (index, sample) in samples.enumerated() {
+        wobble = min(1.1, max(0.9, wobble + Double.random(in: -0.02...0.02)))
+        var delay = sample.delayFromPrevious * slow[index] / (speedFactor * wobble)
+        if index > 0 {
+            sinceStop += meters(samples[index - 1].coordinate, sample.coordinate)
+            if sinceStop >= nextStop {
+                delay += Double.random(in: 4...12)
+                sinceStop = 0
+                nextStop = Double.random(in: 250...700)
+            }
+        }
+        result.append(RoutePlaybackSample(coordinate: sample.coordinate, delayFromPrevious: delay))
+    }
+    return result
+}
+
 private func offsetCoordinate(
     from origin: CLLocationCoordinate2D,
     distance: CLLocationDistance,
@@ -835,8 +1059,20 @@ struct LocationSimulationView: View {
     @State private var wanderMode = false
     @State private var wanderRadius: Double = 500
     @State private var wanderSpeedFactor: Double = 1.0
-    @State private var wanderGoTarget: CLLocationCoordinate2D?
-    @State private var wanderGoRequested: CLLocationCoordinate2D?
+    @State private var wanderGoPoints: [CLLocationCoordinate2D] = []
+    @State private var wanderGoRequested: [CLLocationCoordinate2D]?
+    @State private var wanderTransport: WanderTransport = .driving
+    @State private var wanderZoneKind: WanderZoneKind = .circle
+    @State private var wanderPolygon: [CLLocationCoordinate2D] = []
+    @State private var wanderActivePolygon: [CLLocationCoordinate2D] = []
+    @State private var wanderParked = false
+    @State private var wanderHumanize = true
+    @State private var wanderTravelFromHere = true
+    @State private var wanderStarting = false
+    @State private var wanderZones: [WanderZone] = WanderZoneStore.load()
+    @State private var showSaveZone = false
+    @State private var newZoneName = ""
+    @State private var wanderResumeRequested = false
     @State private var wanderZoneCenter: CLLocationCoordinate2D?
 
     private static let routeDurationFormatter: DateComponentsFormatter = {
@@ -896,7 +1132,15 @@ struct LocationSimulationView: View {
     }
 
     private var wanderCircleCenter: CLLocationCoordinate2D? {
-        wanderZoneCenter ?? (wanderMode ? coordinate : nil)
+        if wanderZoneCenter != nil {
+            return wanderActivePolygon.isEmpty ? wanderZoneCenter : nil
+        }
+        return (wanderMode && wanderZoneKind == .circle) ? coordinate : nil
+    }
+
+    private var wanderPolygonToDraw: [CLLocationCoordinate2D] {
+        if wanderZoneCenter != nil { return wanderActivePolygon }
+        return (wanderMode && wanderZoneKind == .polygon) ? wanderPolygon : []
     }
 
     private var routeSummaryText: String? {
@@ -982,6 +1226,23 @@ struct LocationSimulationView: View {
                             .foregroundStyle(.blue.opacity(0.12))
                             .stroke(.blue, lineWidth: 2)
                     }
+                    if wanderPolygonToDraw.count >= 3 {
+                        MapPolygon(coordinates: wanderPolygonToDraw)
+                            .foregroundStyle(.blue.opacity(0.12))
+                            .stroke(.blue, lineWidth: 2)
+                    } else if wanderPolygonToDraw.count == 2 {
+                        MapPolyline(coordinates: wanderPolygonToDraw)
+                            .stroke(.blue, lineWidth: 2)
+                    }
+                    if wanderZoneCenter == nil {
+                        ForEach(Array(wanderPolygonToDraw.enumerated()), id: \.offset) { item in
+                            Annotation("", coordinate: item.element) {
+                                Circle()
+                                    .fill(.blue)
+                                    .frame(width: 10, height: 10)
+                            }
+                        }
+                    }
                     if hasRouteContext {
                         if let routePolyline {
                             MapPolyline(routePolyline)
@@ -999,8 +1260,8 @@ struct LocationSimulationView: View {
                             Marker("Current", coordinate: displayedRouteCoordinate)
                                 .tint(.blue)
                         }
-                        if let wanderGoTarget {
-                            Marker("Go", coordinate: wanderGoTarget)
+                        ForEach(Array(wanderGoPoints.enumerated()), id: \.offset) { item in
+                            Marker("Go \(item.offset + 1)", coordinate: item.element)
                                 .tint(.orange)
                         }
                     } else if let coordinate {
@@ -1137,6 +1398,13 @@ struct LocationSimulationView: View {
             Button("Cancel", role: .cancel) { newBookmarkName = "" }
         } message: {
             Text("Enter a name for this location.")
+        }
+        .alert("Save Zone", isPresented: $showSaveZone) {
+            TextField("Name", text: $newZoneName)
+            Button("Save") { saveWanderZone() }
+            Button("Cancel", role: .cancel) { newZoneName = "" }
+        } message: {
+            Text("Saves the pin and the radius as a wander zone.")
         }
         .sheet(isPresented: $showBookmarks) {
             BookmarksView(bookmarks: $bookmarks) { bookmark in
@@ -1397,15 +1665,44 @@ struct LocationSimulationView: View {
 
             if wanderMode {
                 VStack(spacing: 6) {
-                    HStack {
-                        Text("Zone radius")
-                        Spacer()
-                        Text("\(Int(wanderRadius)) m")
+                    Picker("Zone", selection: $wanderZoneKind) {
+                        ForEach(WanderZoneKind.allCases) { kind in
+                            Text(kind.title).tag(kind)
+                        }
                     }
-                    .font(.footnote)
-                    .foregroundStyle(.secondary)
+                    .pickerStyle(.segmented)
 
-                    Slider(value: $wanderRadius, in: 200...5000, step: 100)
+                    Picker("Mode", selection: $wanderTransport) {
+                        ForEach(WanderTransport.allCases) { mode in
+                            Text(mode.title).tag(mode)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    if wanderZoneKind == .circle {
+                        HStack {
+                            Text("Zone radius")
+                            Spacer()
+                            Text("\(Int(wanderRadius)) m")
+                        }
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+
+                        Slider(value: $wanderRadius, in: 200...5000, step: 100)
+                    } else {
+                        Text("Tap the map to add corners (\(wanderPolygon.count))")
+                            .font(.footnote)
+                            .foregroundStyle(.secondary)
+
+                        HStack(spacing: 12) {
+                            Button("Undo") { _ = wanderPolygon.popLast() }
+                                .buttonStyle(.bordered)
+                                .disabled(wanderPolygon.isEmpty)
+                            Button("Clear") { wanderPolygon = [] }
+                                .buttonStyle(.bordered)
+                                .disabled(wanderPolygon.isEmpty)
+                        }
+                    }
 
                     HStack {
                         Text("Speed")
@@ -1417,9 +1714,43 @@ struct LocationSimulationView: View {
 
                     Slider(value: $wanderSpeedFactor, in: 0.5...1.5, step: 0.1)
 
+                    Toggle("Natural pauses", isOn: $wanderHumanize)
+
+                    Toggle("Travel from my location", isOn: $wanderTravelFromHere)
+
+                    HStack(spacing: 12) {
+                        Button("Save zone") {
+                            newZoneName = ""
+                            showSaveZone = true
+                        }
+                        .buttonStyle(.bordered)
+
+                        if !wanderZones.isEmpty {
+                            Menu("Saved zones") {
+                                ForEach(wanderZones) { zone in
+                                    Button("\(zone.name) · \(Int(zone.radius)) m") {
+                                        applyWanderZone(zone)
+                                    }
+                                }
+                                Divider()
+                                Menu("Delete") {
+                                    ForEach(wanderZones) { zone in
+                                        Button(zone.name, role: .destructive) {
+                                            deleteWanderZone(zone)
+                                        }
+                                    }
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                        }
+                    }
+
                     Button("Start Wander", action: startWander)
                         .buttonStyle(.borderedProminent)
-                        .disabled(!pairingExists || isBusy || isRouteRunning)
+                        .disabled(
+                            !pairingExists || isBusy || isRouteRunning || wanderStarting ||
+                            (wanderZoneKind == .polygon && wanderPolygon.count < 3)
+                        )
                 }
             }
         } else {
@@ -1456,14 +1787,30 @@ struct LocationSimulationView: View {
             }
 
             if wanderZoneCenter != nil {
-                if wanderGoTarget != nil {
-                    Button("Go here") { wanderGoRequested = wanderGoTarget }
+                if !wanderGoPoints.isEmpty {
+                    HStack(spacing: 12) {
+                        Button(wanderGoPoints.count == 1 ? "Go here" : "Go to \(wanderGoPoints.count) places") {
+                            wanderGoRequested = wanderGoPoints
+                        }
                         .buttonStyle(.borderedProminent)
                         .tint(.orange)
-                } else {
-                    Text("Tap the map to pick a place to drive to")
+
+                        Button("Clear") { wanderGoPoints = [] }
+                            .buttonStyle(.bordered)
+                    }
+                } else if wanderParked {
+                    Text("Parked. Tap the map to pick other places.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
+                } else {
+                    Text("Tap the map to pick places to drive to")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
+                if wanderParked {
+                    Button("Resume wandering") { wanderResumeRequested = true }
+                        .buttonStyle(.borderedProminent)
                 }
             }
 
@@ -1568,8 +1915,11 @@ struct LocationSimulationView: View {
         cancelRoutePlayback(resetMarker: true)
         stopResendLoop()
         wanderZoneCenter = nil
-        wanderGoTarget = nil
+        wanderGoPoints = []
+        wanderActivePolygon = []
         wanderGoRequested = nil
+        wanderParked = false
+        wanderResumeRequested = false
         LocationSimulationSession.shared.clearRoute()
         runLocationCommand(
             errorTitle: "Clear Failed",
@@ -1617,8 +1967,13 @@ struct LocationSimulationView: View {
 
     private func applySelection(_ coordinate: CLLocationCoordinate2D) {
         if wanderZoneCenter != nil {
-            // While wandering, a tap picks a place to drive to.
-            wanderGoTarget = coordinate
+            // While wandering, taps queue places to drive to, in order.
+            if wanderGoPoints.count < 8 { wanderGoPoints.append(coordinate) }
+            return
+        }
+        if wanderMode && wanderZoneKind == .polygon && !isRouteRunning {
+            if wanderPolygon.count < 40 { wanderPolygon.append(coordinate) }
+            if self.coordinate == nil { self.coordinate = coordinate }
             return
         }
         guard !isRouteRunning else { return }
@@ -1806,7 +2161,21 @@ struct LocationSimulationView: View {
         stopWhen: (() -> Bool)? = nil
     ) async -> Bool {
         for sample in samples {
-            try? await Task.sleep(for: .seconds(sample.delayFromPrevious))
+            var remaining = sample.delayFromPrevious
+            // Long stops are split so the position keeps being re-sent meanwhile.
+            while remaining > 2.5 {
+                try? await Task.sleep(for: .seconds(2.5))
+                remaining -= 2.5
+                guard !Task.isCancelled,
+                      LocationSimulationSession.shared.isCurrentRoute(routeID) else {
+                    return false
+                }
+                if let stopWhen, stopWhen() { return true }
+                if let here = lastSuccessfulCoordinate {
+                    _ = await sendLocationUpdate(for: here)
+                }
+            }
+            try? await Task.sleep(for: .seconds(remaining))
             guard !Task.isCancelled,
                   LocationSimulationSession.shared.isCurrentRoute(routeID) else {
                 return false
@@ -1820,8 +2189,11 @@ struct LocationSimulationView: View {
                 await MainActor.run {
                     routePlaybackTask = nil
                     wanderZoneCenter = nil
-                    wanderGoTarget = nil
+                    wanderGoPoints = []
+                    wanderActivePolygon = []
                     wanderGoRequested = nil
+                    wanderParked = false
+                    wanderResumeRequested = false
                     routePlaybackCoordinate = fallback
                     LocationSimulationSession.shared.clearRoute()
                     if let fallback {
@@ -1845,10 +2217,136 @@ struct LocationSimulationView: View {
         return true
     }
 
+    private func resetWanderState() {
+        wanderZoneCenter = nil
+        wanderActivePolygon = []
+        wanderGoPoints = []
+        wanderGoRequested = nil
+        wanderParked = false
+        wanderResumeRequested = false
+    }
+
+    private func saveWanderZone() {
+        guard let pin = coordinate else { return }
+        let trimmed = newZoneName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let name = trimmed.isEmpty ? "Zone \(wanderZones.count + 1)" : trimmed
+        let zone: WanderZone
+        if wanderZoneKind == .polygon, wanderPolygon.count >= 3 {
+            let shape = WanderZoneShape(polygon: wanderPolygon)
+            zone = WanderZone(
+                name: name,
+                latitude: shape.center.latitude,
+                longitude: shape.center.longitude,
+                radius: shape.radius,
+                polygon: wanderPolygon.map { WanderPoint($0) }
+            )
+        } else {
+            zone = WanderZone(
+                name: name,
+                latitude: pin.latitude,
+                longitude: pin.longitude,
+                radius: wanderRadius,
+                polygon: nil
+            )
+        }
+        wanderZones.append(zone)
+        WanderZoneStore.save(wanderZones)
+        newZoneName = ""
+    }
+
+    private func applyWanderZone(_ zone: WanderZone) {
+        coordinate = zone.coordinate
+        wanderRadius = min(max(zone.radius, 200), 5000)
+        if let points = zone.polygon, points.count >= 3 {
+            wanderZoneKind = .polygon
+            wanderPolygon = points.map { $0.coordinate }
+        } else {
+            wanderZoneKind = .circle
+        }
+        wanderMode = true
+        position = .region(
+            MKCoordinateRegion(
+                center: zone.coordinate,
+                latitudinalMeters: zone.radius * 3,
+                longitudinalMeters: zone.radius * 3
+            )
+        )
+    }
+
+    private func deleteWanderZone(_ zone: WanderZone) {
+        wanderZones.removeAll { $0.id == zone.id }
+        WanderZoneStore.save(wanderZones)
+    }
+
     private func startWander() {
-        guard pairingExists, !isBusy, let center = coordinate else { return }
-        let radius = wanderRadius
+        guard pairingExists, !isBusy, !wanderStarting, let pin = coordinate else { return }
+        let usePolygon = wanderZoneKind == .polygon
+        guard !usePolygon || wanderPolygon.count >= 3 else { return }
+
+        let zone = usePolygon
+            ? WanderZoneShape(polygon: wanderPolygon)
+            : WanderZoneShape(center: pin, radius: wanderRadius)
+        let start = usePolygon ? zone.randomPoint() : pin
+        let travelFromHere = wanderTravelFromHere
         let speedFactor = wanderSpeedFactor
+        let humanize = wanderHumanize
+        let transport = wanderTransport
+
+        wanderStarting = true
+        Task {
+            let origin = travelFromHere ? await currentWanderOrigin() : nil
+            await MainActor.run {
+                wanderStarting = false
+                launchWander(
+                    zone: zone,
+                    start: start,
+                    origin: origin,
+                    speedFactor: speedFactor,
+                    humanize: humanize,
+                    transport: transport
+                )
+            }
+        }
+    }
+
+    /// Where the phone is right now: the simulated spot if one is active,
+    /// otherwise the real location.
+    private func currentWanderOrigin() async -> CLLocationCoordinate2D? {
+        let session = LocationSimulationSession.shared
+        if session.isActive, let simulated = session.coordinate { return simulated }
+        return await OneShotLocationProvider().current()
+    }
+
+    /// Decides whether to travel to the zone from `origin` or just jump there.
+    private func wanderApproachPlan(
+        origin: CLLocationCoordinate2D?,
+        start: CLLocationCoordinate2D
+    ) -> (first: CLLocationCoordinate2D, approachTo: CLLocationCoordinate2D?, notice: String?) {
+        guard let origin else { return (start, nil, nil) }
+        let distance = CLLocation(latitude: origin.latitude, longitude: origin.longitude)
+            .distance(from: CLLocation(latitude: start.latitude, longitude: start.longitude))
+        if distance > 50_000 {
+            return (start, nil, "The zone is \(Int(distance / 1000)) km away, so it jumped there instead of traveling.")
+        }
+        if distance > 30 {
+            return (origin, start, nil)
+        }
+        return (start, nil, nil)
+    }
+
+    private func launchWander(
+        zone: WanderZoneShape,
+        start: CLLocationCoordinate2D,
+        origin: CLLocationCoordinate2D?,
+        speedFactor: Double,
+        humanize: Bool,
+        transport: WanderTransport
+    ) {
+        let plan = wanderApproachPlan(origin: origin, start: start)
+        let first = plan.first
+        let approachTo = plan.approachTo
+        let notice = plan.notice
+
         stopResendLoop()
         cancelRoutePlayback(resetMarker: false)
         runLocationCommand(
@@ -1856,35 +2354,98 @@ struct LocationSimulationView: View {
             errorMessage: { code in
                 "Could not start wander simulation (error \(code)). Make sure the device is connected and the DDI is mounted."
             },
-            operation: { locationUpdateCode(for: center) }
+            operation: { locationUpdateCode(for: first) }
         ) {
             beginBackgroundTask()
-            let routeID = LocationSimulationSession.shared.startRoute(at: center, coordinates: [center])
+            let routeID = LocationSimulationSession.shared.startRoute(at: first, coordinates: [first])
             simulatedCoordinate = nil
-            routePlaybackCoordinate = center
-            wanderZoneCenter = center
-            startWanderPlayback(routeID: routeID, center: center, radius: radius, speedFactor: speedFactor)
+            routePlaybackCoordinate = first
+            wanderGoPoints = []
+            wanderZoneCenter = zone.center
+            wanderActivePolygon = zone.polygon
+            if let notice {
+                alertTitle = "Jumped to the zone"
+                alertMessage = notice
+                showAlert = true
+            }
+            startWanderPlayback(
+                routeID: routeID,
+                zone: zone,
+                start: first,
+                approachTo: approachTo,
+                speedFactor: speedFactor,
+                humanize: humanize,
+                transport: transport
+            )
         }
     }
 
     private func startWanderPlayback(
         routeID: UUID,
-        center: CLLocationCoordinate2D,
-        radius: CLLocationDistance,
-        speedFactor: Double
+        zone: WanderZoneShape,
+        start: CLLocationCoordinate2D,
+        approachTo: CLLocationCoordinate2D?,
+        speedFactor: Double,
+        humanize: Bool,
+        transport: WanderTransport
     ) {
         routePlaybackTask = Task {
-            var lastSuccessfulCoordinate: CLLocationCoordinate2D? = center
-            var current = center
+            var lastSuccessfulCoordinate: CLLocationCoordinate2D? = start
+            var current = start
             var upcoming: [RoutePlaybackSample]?
             var heading: CLLocationDirection?
             var emptyRounds = 0
+
+            // First travel from where the phone is to the zone, then start wandering.
+            if let target = approachTo {
+                if let approach = await goLeg(from: start, to: target, transport: transport), approach.count > 1 {
+                    let scaled = humanizedSamples(approach, speedFactor: speedFactor, humanize: humanize)
+                    let arrived = await playSamples(
+                        Array(scaled.dropFirst()),
+                        routeID: routeID,
+                        lastSuccessfulCoordinate: &lastSuccessfulCoordinate,
+                        stopWhen: { wanderGoRequested != nil }
+                    )
+                    guard arrived else { return }
+                    current = lastSuccessfulCoordinate ?? target
+                    heading = bearingDegrees(
+                        from: approach[approach.count - 2].coordinate,
+                        to: approach[approach.count - 1].coordinate
+                    )
+                } else {
+                    let code = await sendLocationUpdate(for: target)
+                    guard LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
+                    if code == 0 {
+                        lastSuccessfulCoordinate = target
+                        current = target
+                        await MainActor.run {
+                            routePlaybackCoordinate = target
+                            LocationSimulationSession.shared.updateCoordinate(target)
+                            alertTitle = "Jumped to the zone"
+                            alertMessage = "Could not find a route from where you are to the zone, so it jumped there instead."
+                            showAlert = true
+                        }
+                    }
+                }
+
+                if await MainActor.run(body: { wanderGoRequested != nil }) {
+                    let keepGoing = await driveToRequestedPlaces(
+                        routeID: routeID,
+                        speedFactor: speedFactor,
+                        humanize: humanize,
+                        transport: transport,
+                        lastSuccessfulCoordinate: &lastSuccessfulCoordinate
+                    )
+                    guard keepGoing else { return }
+                    current = lastSuccessfulCoordinate ?? current
+                }
+            }
 
             while !Task.isCancelled, LocationSimulationSession.shared.isCurrentRoute(routeID) {
                 var leg = upcoming
                 upcoming = nil
                 if leg == nil {
-                    leg = await wanderLeg(from: current, center: center, radius: radius, heading: heading)
+                    leg = await wanderLeg(from: current, zone: zone, heading: heading, transport: transport)
                 }
 
                 guard let samples = leg, samples.count > 1 else {
@@ -1894,16 +2455,14 @@ struct LocationSimulationView: View {
                         await MainActor.run {
                             guard LocationSimulationSession.shared.isCurrentRoute(routeID) else { return }
                             routePlaybackTask = nil
-                            wanderZoneCenter = nil
-                            wanderGoTarget = nil
-                            wanderGoRequested = nil
+                            resetWanderState()
                             LocationSimulationSession.shared.clearRoute()
                             if let last {
                                 routePlaybackCoordinate = last
                                 startResendLoop(with: last)
                             }
                             alertTitle = "Wander Stopped"
-                            alertMessage = "Could not find a route that stays inside the zone. Try a larger radius or a spot with more streets."
+                            alertMessage = "Could not find a route that stays inside the zone. Try a larger zone or a spot with more streets."
                             showAlert = true
                         }
                         return
@@ -1916,13 +2475,10 @@ struct LocationSimulationView: View {
                 let end = samples[samples.count - 1].coordinate
                 let newHeading = bearingDegrees(from: samples[samples.count - 2].coordinate, to: end)
                 // Compute the next leg while this one is playing.
-                let prefetch = Task { await wanderLeg(from: end, center: center, radius: radius, heading: newHeading) }
-                let scaled = samples.map {
-                    RoutePlaybackSample(
-                        coordinate: $0.coordinate,
-                        delayFromPrevious: $0.delayFromPrevious / speedFactor
-                    )
+                let prefetch = Task {
+                    await wanderLeg(from: end, zone: zone, heading: newHeading, transport: transport)
                 }
+                let scaled = humanizedSamples(samples, speedFactor: speedFactor, humanize: humanize)
                 let finished = await playSamples(
                     Array(scaled.dropFirst()),
                     routeID: routeID,
@@ -1936,12 +2492,31 @@ struct LocationSimulationView: View {
                 current = lastSuccessfulCoordinate ?? end
                 heading = newHeading
 
+                if humanize {
+                    // Short stop at each destination, ended early by a "Go" request.
+                    let pause = Double.random(in: 3...15)
+                    var waited = 0.0
+                    var ticks = 0
+                    while waited < pause,
+                          !Task.isCancelled,
+                          await MainActor.run(body: { wanderGoRequested == nil }) {
+                        try? await Task.sleep(for: .milliseconds(300))
+                        waited += 0.3
+                        ticks += 1
+                        if ticks % 10 == 0, let here = lastSuccessfulCoordinate {
+                            _ = await sendLocationUpdate(for: here)
+                        }
+                    }
+                }
+
                 if await MainActor.run(body: { wanderGoRequested != nil }) {
                     prefetch.cancel()
                     upcoming = nil
                     let keepGoing = await driveToRequestedPlaces(
                         routeID: routeID,
                         speedFactor: speedFactor,
+                        humanize: humanize,
+                        transport: transport,
                         lastSuccessfulCoordinate: &lastSuccessfulCoordinate
                     )
                     guard keepGoing else { return }
@@ -1953,99 +2528,162 @@ struct LocationSimulationView: View {
         }
     }
 
-    /// Drives to the places the user picks while wandering, ignoring the zone.
+    /// Drives through the places the user queued while wandering (in order, ignoring
+    /// the zone), parks at the last one and waits for "Resume wandering" or a new queue.
     /// Returns false when the wander task should stop.
     private func driveToRequestedPlaces(
         routeID: UUID,
         speedFactor: Double,
+        humanize: Bool,
+        transport: WanderTransport,
         lastSuccessfulCoordinate: inout CLLocationCoordinate2D?
     ) async -> Bool {
         while true {
-            guard let target = await MainActor.run(body: { wanderGoRequested }) else { return true }
+            guard let targets = await MainActor.run(body: { wanderGoRequested }) else { return true }
             await MainActor.run { wanderGoRequested = nil }
 
-            guard LocationSimulationSession.shared.isCurrentRoute(routeID),
-                  let from = lastSuccessfulCoordinate else {
-                return false
-            }
-
-            guard let samples = await goLeg(from: from, to: target), samples.count > 1 else {
-                await MainActor.run {
-                    wanderGoTarget = nil
-                    alertTitle = "Go Here Failed"
-                    alertMessage = "Could not find a driving route to that place. Wandering continues."
-                    showAlert = true
+            var interrupted = false
+            for (index, target) in targets.enumerated() {
+                guard LocationSimulationSession.shared.isCurrentRoute(routeID),
+                      let from = lastSuccessfulCoordinate else {
+                    return false
                 }
-                continue
-            }
 
-            let scaled = samples.map {
-                RoutePlaybackSample(
-                    coordinate: $0.coordinate,
-                    delayFromPrevious: $0.delayFromPrevious / speedFactor
+                guard let samples = await goLeg(from: from, to: target, transport: transport),
+                      samples.count > 1 else {
+                    await MainActor.run {
+                        alertTitle = "Go Here Failed"
+                        alertMessage = "Could not find a route to one of the places. Skipping it."
+                        showAlert = true
+                    }
+                    continue
+                }
+
+                let scaled = humanizedSamples(samples, speedFactor: speedFactor, humanize: humanize)
+                let finished = await playSamples(
+                    Array(scaled.dropFirst()),
+                    routeID: routeID,
+                    lastSuccessfulCoordinate: &lastSuccessfulCoordinate,
+                    stopWhen: { wanderGoRequested != nil }
                 )
+                guard finished else { return false }
+                if await MainActor.run(body: { wanderGoRequested != nil }) {
+                    interrupted = true
+                    break
+                }
+
+                // Short stop at the places in between.
+                if index < targets.count - 1 {
+                    let hold = humanize ? Double.random(in: 4...10) : 1
+                    var waited = 0.0
+                    while waited < hold,
+                          !Task.isCancelled,
+                          await MainActor.run(body: { wanderGoRequested == nil }) {
+                        try? await Task.sleep(for: .milliseconds(300))
+                        waited += 0.3
+                    }
+                    if await MainActor.run(body: { wanderGoRequested != nil }) {
+                        interrupted = true
+                        break
+                    }
+                }
             }
-            let finished = await playSamples(
-                Array(scaled.dropFirst()),
-                routeID: routeID,
-                lastSuccessfulCoordinate: &lastSuccessfulCoordinate,
-                stopWhen: { wanderGoRequested != nil }
-            )
-            guard finished else { return false }
+            if interrupted { continue }
 
             await MainActor.run {
-                if wanderGoRequested == nil,
-                   let marker = wanderGoTarget,
-                   marker.latitude == target.latitude,
-                   marker.longitude == target.longitude {
-                    wanderGoTarget = nil
+                wanderGoPoints.removeAll { point in
+                    targets.contains { $0.latitude == point.latitude && $0.longitude == point.longitude }
+                }
+                wanderParked = true
+            }
+
+            // Stay parked here until the user resumes wandering or queues other places.
+            var ticks = 0
+            while true {
+                guard !Task.isCancelled,
+                      LocationSimulationSession.shared.isCurrentRoute(routeID) else {
+                    return false
+                }
+                let (goRequested, resumeRequested) = await MainActor.run {
+                    (wanderGoRequested != nil, wanderResumeRequested)
+                }
+                if goRequested {
+                    await MainActor.run { wanderParked = false }
+                    break
+                }
+                if resumeRequested {
+                    await MainActor.run {
+                        wanderParked = false
+                        wanderResumeRequested = false
+                    }
+                    return true
+                }
+                try? await Task.sleep(for: .milliseconds(300))
+                ticks += 1
+                // Keep re-sending the parked position so it does not drift back.
+                if ticks % 16 == 0, let here = lastSuccessfulCoordinate {
+                    _ = await sendLocationUpdate(for: here)
                 }
             }
         }
     }
 
-    private func goLeg(
-        from start: CLLocationCoordinate2D,
-        to destination: CLLocationCoordinate2D
-    ) async -> [RoutePlaybackSample]? {
-        let request = MKDirections.Request()
-        request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
-        request.destination = MKMapItem(placemark: MKPlacemark(coordinate: destination))
-        request.requestsAlternateRoutes = false
-        request.transportType = .automobile
-
-        guard let route = try? await MKDirections(request: request).calculate().routes.first else {
-            return nil
-        }
+    private func routeSamples(
+        for route: MKRoute,
+        transport: WanderTransport
+    ) async -> [RoutePlaybackSample] {
         let coordinates = route.polyline.coordinateArray
-        guard coordinates.count > 1 else { return nil }
-
         let display = sampledRouteCoordinates(
             from: coordinates,
             targetDistance: RouteSimulationDefaults.pathSamplingDistance
         )
         let fallbackSpeed = route.expectedTravelTime > 0 ? route.distance / route.expectedTravelTime : 13.4
-        return await prefetchRoutePlaybackSamples(
-            displayCoordinates: display,
+        if transport == .driving {
+            // Same speed-limit lookup as "Play Route".
+            return await prefetchRoutePlaybackSamples(
+                displayCoordinates: display,
+                fallbackSpeedMetersPerSecond: fallbackSpeed
+            )
+        }
+        return buildPlaybackSamples(
+            from: display,
+            speedWays: [],
             fallbackSpeedMetersPerSecond: fallbackSpeed
         )
     }
 
+    private func goLeg(
+        from start: CLLocationCoordinate2D,
+        to destination: CLLocationCoordinate2D,
+        transport: WanderTransport
+    ) async -> [RoutePlaybackSample]? {
+        let request = MKDirections.Request()
+        request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
+        request.destination = MKMapItem(placemark: MKPlacemark(coordinate: destination))
+        request.requestsAlternateRoutes = false
+        request.transportType = transport.mapKitType
+
+        guard let route = try? await MKDirections(request: request).calculate().routes.first,
+              route.polyline.pointCount > 1 else {
+            return nil
+        }
+        return await routeSamples(for: route, transport: transport)
+    }
+
     /// Picks a destination ahead of the current heading (so the drive keeps
-    /// flowing instead of zig-zagging) and asks MapKit for a driving route,
-    /// which respects one-way streets. Routes that leave the zone, start with
-    /// a U-turn or take a big detour are discarded. Speeds come from the same
-    /// OpenStreetMap speed-limit lookup that "Play Route" uses.
+    /// flowing instead of zig-zagging) and asks MapKit for a route, which
+    /// respects one-way streets. Routes that leave the zone, start with a
+    /// U-turn or take a big detour are discarded.
     private func wanderLeg(
         from start: CLLocationCoordinate2D,
-        center: CLLocationCoordinate2D,
-        radius: CLLocationDistance,
-        heading: CLLocationDirection?
+        zone: WanderZoneShape,
+        heading: CLLocationDirection?,
+        transport: WanderTransport
     ) async -> [RoutePlaybackSample]? {
-        let centerLocation = CLLocation(latitude: center.latitude, longitude: center.longitude)
         let startLocation = CLLocation(latitude: start.latitude, longitude: start.longitude)
-        // After a manual trip outside the zone, drive back in without the zone limits.
-        let startsOutside = startLocation.distance(from: centerLocation) > radius
+        // After a manual trip outside the zone, come back in without the zone limits.
+        let startsOutside = !zone.contains(start)
+        let radius = zone.radius
 
         for attempt in 0..<10 {
             guard !Task.isCancelled else { return nil }
@@ -2058,11 +2696,11 @@ struct LocationSimulationView: View {
                 let upper = max(min(1200, radius * 1.2), 350)
                 destination = offsetCoordinate(from: start, distance: Double.random(in: lower...upper), bearing: angle)
             } else {
-                destination = randomCoordinate(around: center, radius: radius)
+                destination = zone.randomPoint()
             }
 
+            guard zone.contains(destination) else { continue }
             let destinationLocation = CLLocation(latitude: destination.latitude, longitude: destination.longitude)
-            guard destinationLocation.distance(from: centerLocation) <= radius * 0.95 else { continue }
             let straightDistance = destinationLocation.distance(from: startLocation)
             guard straightDistance >= min(150, radius / 2) else { continue }
 
@@ -2070,7 +2708,7 @@ struct LocationSimulationView: View {
             request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
             request.destination = MKMapItem(placemark: MKPlacemark(coordinate: destination))
             request.requestsAlternateRoutes = false
-            request.transportType = .automobile
+            request.transportType = transport.mapKitType
 
             guard let route = try? await MKDirections(request: request).calculate().routes.first else {
                 try? await Task.sleep(for: .seconds(1))
@@ -2080,10 +2718,7 @@ struct LocationSimulationView: View {
             let coordinates = route.polyline.coordinateArray
             guard coordinates.count > 1 else { continue }
 
-            let staysInside = coordinates.allSatisfy { point in
-                CLLocation(latitude: point.latitude, longitude: point.longitude)
-                    .distance(from: centerLocation) <= radius
-            }
+            let staysInside = coordinates.allSatisfy { zone.contains($0) }
             guard staysInside || startsOutside else { continue }
 
             if strict && !startsOutside {
@@ -2101,15 +2736,7 @@ struct LocationSimulationView: View {
                 }
             }
 
-            let display = sampledRouteCoordinates(
-                from: coordinates,
-                targetDistance: RouteSimulationDefaults.pathSamplingDistance
-            )
-            let fallbackSpeed = route.expectedTravelTime > 0 ? route.distance / route.expectedTravelTime : 13.4
-            let samples = await prefetchRoutePlaybackSamples(
-                displayCoordinates: display,
-                fallbackSpeedMetersPerSecond: fallbackSpeed
-            )
+            let samples = await routeSamples(for: route, transport: transport)
             if samples.count > 1 { return samples }
         }
         return nil
