@@ -107,9 +107,18 @@ private final class OneShotLocationProvider: NSObject, CLLocationManagerDelegate
             manager.requestLocation()
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(8))
-                self.finish(nil)
+                self.finish(self.recentKnownLocation())
             }
         }
+    }
+
+    /// The last location iOS knows, if it is recent enough to trust.
+    private func recentKnownLocation() -> CLLocationCoordinate2D? {
+        guard let location = manager.location,
+              Date().timeIntervalSince(location.timestamp) < 900 else {
+            return nil
+        }
+        return location.coordinate
     }
 
     private func finish(_ coordinate: CLLocationCoordinate2D?) {
@@ -123,7 +132,43 @@ private final class OneShotLocationProvider: NSObject, CLLocationManagerDelegate
     }
 
     nonisolated func locationManager(_ manager: CLLocationManager, didFailWithError error: Error) {
-        Task { @MainActor in self.finish(nil) }
+        Task { @MainActor in self.finish(self.recentKnownLocation()) }
+    }
+}
+
+private struct TrailPoint: Equatable {
+    var latitude: Double
+    var longitude: Double
+    var time: Date
+
+    var coordinate: CLLocationCoordinate2D {
+        CLLocationCoordinate2D(latitude: latitude, longitude: longitude)
+    }
+}
+
+/// The recorded trail as a GPX file, shared through the system share sheet.
+private struct GPXExport: Transferable {
+    let points: [TrailPoint]
+
+    var gpx: String {
+        let formatter = ISO8601DateFormatter()
+        var xml = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n"
+        xml += "<gpx version=\"1.1\" creator=\"StikDebug\" xmlns=\"http://www.topografix.com/GPX/1/1\">\n"
+        xml += "<trk><name>StikDebug trail</name><trkseg>\n"
+        for point in points {
+            xml += "<trkpt lat=\"\(point.latitude)\" lon=\"\(point.longitude)\">"
+            xml += "<time>\(formatter.string(from: point.time))</time></trkpt>\n"
+        }
+        xml += "</trkseg></trk>\n</gpx>\n"
+        return xml
+    }
+
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: UTType(filenameExtension: "gpx") ?? .xml) { export in
+            let url = FileManager.default.temporaryDirectory.appendingPathComponent("StikDebug-trail.gpx")
+            try export.gpx.write(to: url, atomically: true, encoding: .utf8)
+            return SentTransferredFile(url)
+        }
     }
 }
 
@@ -176,10 +221,27 @@ private enum WanderTransport: String, CaseIterable, Identifiable {
 private struct WanderTravel {
     let mode: WanderTransport
     let topSpeed: CLLocationSpeed // m/s, used by Moto: always rides at this speed
+    let avoidHighways: Bool
 
     var mapKitType: MKDirectionsTransportType { mode.mapKitType }
     var stopSpacing: ClosedRange<Double> { mode == .moto ? 700...1800 : 250...700 }
     var reach: Double { mode == .moto ? 3 : 1 }
+    /// Distance over which it speeds up after a stop and slows down before the next one.
+    var rampDistance: Double {
+        switch mode {
+        case .walking: return 0
+        case .moto: return 50
+        case .driving: return 40
+        }
+    }
+
+    func configure(_ request: MKDirections.Request) {
+        request.transportType = mapKitType
+        if avoidHighways && mode != .walking {
+            request.highwayPreference = .avoid
+            request.tollPreference = .avoid
+        }
+    }
 }
 
 private enum WanderZoneKind: String, CaseIterable, Identifiable {
@@ -277,7 +339,8 @@ private func humanizedSamples(
     _ samples: [RoutePlaybackSample],
     speedFactor: Double,
     humanize: Bool,
-    stopSpacing: ClosedRange<Double> = 250...700
+    stopSpacing: ClosedRange<Double> = 250...700,
+    rampDistance: Double = 40
 ) -> [RoutePlaybackSample] {
     guard samples.count > 1 else { return samples }
     guard humanize else {
@@ -306,20 +369,46 @@ private func humanizedSamples(
         }
     }
 
-    var wobble = 1.0
+    // Distance along the path, and where the random stops happen. The car waits
+    // at sample (index - 1) before moving to the sample at `index`.
+    var cumulative = [Double](repeating: 0, count: samples.count)
+    for index in 1..<samples.count {
+        cumulative[index] = cumulative[index - 1] + meters(samples[index - 1].coordinate, samples[index].coordinate)
+    }
+    let total = cumulative[samples.count - 1]
+
+    var stopIndices: Set<Int> = []
     var sinceStop = 0.0
     var nextStop = Double.random(in: stopSpacing)
+    for index in 1..<samples.count {
+        sinceStop += cumulative[index] - cumulative[index - 1]
+        if sinceStop >= nextStop {
+            stopIndices.insert(index)
+            sinceStop = 0
+            nextStop = Double.random(in: stopSpacing)
+        }
+    }
+    let stopPositions = stopIndices.map { cumulative[$0 - 1] }.sorted()
+
+    // Speed multiplier (0.3...1) that ramps up after a stop and down before one.
+    func ramp(_ distance: Double) -> Double {
+        guard rampDistance > 0 else { return 1 }
+        return 0.3 + 0.7 * min(1, max(0, distance) / rampDistance)
+    }
+
+    var wobble = 1.0
+    var lastStopPosition = 0.0 // the start of the leg counts as a stop
     var result: [RoutePlaybackSample] = []
     for (index, sample) in samples.enumerated() {
         wobble = min(1.1, max(0.9, wobble + Double.random(in: -0.02...0.02)))
-        var delay = sample.delayFromPrevious * slow[index] / (speedFactor * wobble)
-        if index > 0 {
-            sinceStop += meters(samples[index - 1].coordinate, sample.coordinate)
-            if sinceStop >= nextStop {
-                delay += Double.random(in: 4...12)
-                sinceStop = 0
-                nextStop = Double.random(in: stopSpacing)
-            }
+        let here = cumulative[index]
+        let nextStopPosition = stopPositions.first(where: { $0 >= here }) ?? total
+        let rampFactor = min(ramp(here - lastStopPosition), ramp(nextStopPosition - here))
+
+        var delay = sample.delayFromPrevious * slow[index] / (speedFactor * wobble * rampFactor)
+        if stopIndices.contains(index) {
+            delay += Double.random(in: 4...12)
+            lastStopPosition = cumulative[index - 1]
         }
         result.append(RoutePlaybackSample(coordinate: sample.coordinate, delayFromPrevious: delay))
     }
@@ -1077,19 +1166,23 @@ struct LocationSimulationView: View {
     @State private var routeRequestID = UUID()
     @State private var routeLoopMode: RouteLoopMode = .off
     @State private var wanderMode = false
-    @State private var wanderRadius: Double = 500
-    @State private var wanderSpeedFactor: Double = 1.0
+    @AppStorage("wander.radius") private var wanderRadius: Double = 500
+    @AppStorage("wander.speedFactor") private var wanderSpeedFactor: Double = 1.0
     @State private var wanderGoPoints: [CLLocationCoordinate2D] = []
     @State private var wanderGoRequested: [CLLocationCoordinate2D]?
-    @State private var wanderTransport: WanderTransport = .driving
-    @State private var wanderTopSpeedKmh: Double = 80
-    @State private var wanderZoneKind: WanderZoneKind = .circle
+    @AppStorage("wander.transport") private var wanderTransport: WanderTransport = .driving
+    @AppStorage("wander.topSpeedKmh") private var wanderTopSpeedKmh: Double = 80
+    @AppStorage("wander.avoidHighways") private var wanderAvoidHighways = false
+    @AppStorage("wander.parkMinutes") private var wanderParkMinutes: Double = 0
+    @AppStorage("wander.zoneKind") private var wanderZoneKind: WanderZoneKind = .circle
     @State private var wanderPolygon: [CLLocationCoordinate2D] = []
     @State private var wanderActivePolygon: [CLLocationCoordinate2D] = []
     @State private var wanderParked = false
-    @State private var wanderHumanize = true
-    @State private var wanderTravelFromHere = true
+    @AppStorage("wander.humanize") private var wanderHumanize = true
+    @AppStorage("wander.travelFromHere") private var wanderTravelFromHere = true
     @State private var wanderStarting = false
+    @State private var wanderStatusText: String?
+    @State private var routeTrail: [TrailPoint] = []
     @State private var wanderZones: [WanderZone] = WanderZoneStore.load()
     @State private var showSaveZone = false
     @State private var newZoneName = ""
@@ -1242,6 +1335,10 @@ struct LocationSimulationView: View {
         ZStack(alignment: .bottom) {
             MapReader { proxy in
                 Map(position: $position) {
+                    if routeTrail.count > 1 {
+                        MapPolyline(coordinates: routeTrail.suffix(5000).map { $0.coordinate })
+                            .stroke(.orange.opacity(0.85), lineWidth: 3)
+                    }
                     if let circleCenter = wanderCircleCenter {
                         MapCircle(center: circleCenter, radius: wanderRadius)
                             .foregroundStyle(.blue.opacity(0.12))
@@ -1712,6 +1809,10 @@ struct LocationSimulationView: View {
                         Slider(value: $wanderTopSpeedKmh, in: 30...120, step: 5)
                     }
 
+                    if wanderTransport != .walking {
+                        Toggle("Avoid highways & tolls", isOn: $wanderAvoidHighways)
+                    }
+
                     if wanderZoneKind == .circle {
                         HStack {
                             Text("Zone radius")
@@ -1751,6 +1852,16 @@ struct LocationSimulationView: View {
 
                     Toggle("Travel from my location", isOn: $wanderTravelFromHere)
 
+                    HStack {
+                        Text("Stay at Go places")
+                        Spacer()
+                        Text(wanderParkMinutes == 0 ? "until I resume" : "\(Int(wanderParkMinutes)) min")
+                    }
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
+                    Slider(value: $wanderParkMinutes, in: 0...60, step: 5)
+
                     HStack(spacing: 12) {
                         Button("Save zone") {
                             newZoneName = ""
@@ -1786,6 +1897,8 @@ struct LocationSimulationView: View {
                         )
                 }
             }
+
+            trailControls
         } else {
             Text("Tap map to drop pin")
                 .font(.subheadline)
@@ -1820,6 +1933,12 @@ struct LocationSimulationView: View {
             }
 
             if wanderZoneCenter != nil {
+                if let wanderStatusText {
+                    Text(wanderStatusText)
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                }
+
                 if !wanderGoPoints.isEmpty {
                     HStack(spacing: 12) {
                         Button(wanderGoPoints.count == 1 ? "Go here" : "Go to \(wanderGoPoints.count) places") {
@@ -1846,6 +1965,8 @@ struct LocationSimulationView: View {
                         .buttonStyle(.borderedProminent)
                 }
             }
+
+            trailControls
 
             HStack(spacing: 12) {
                 Button("Stop", action: clear)
@@ -2129,6 +2250,8 @@ struct LocationSimulationView: View {
     private func startRoutePlayback(routeID: UUID) {
         let original = routePlaybackSamples
         guard !original.isEmpty else { return }
+        routeTrail = []
+        if let firstSample = original.first { recordTrail(firstSample.coordinate) }
         routePlaybackTask = Task {
             var lastSuccessfulCoordinate: CLLocationCoordinate2D? = original.first?.coordinate
             var forward = true
@@ -2245,12 +2368,44 @@ struct LocationSimulationView: View {
             await MainActor.run {
                 routePlaybackCoordinate = sample.coordinate
                 LocationSimulationSession.shared.updateCoordinate(sample.coordinate)
+                recordTrail(sample.coordinate)
             }
         }
         return true
     }
 
+    private func recordTrail(_ coordinate: CLLocationCoordinate2D) {
+        if let last = routeTrail.last {
+            let moved = CLLocation(latitude: last.latitude, longitude: last.longitude)
+                .distance(from: CLLocation(latitude: coordinate.latitude, longitude: coordinate.longitude))
+            guard moved >= 8 else { return }
+        }
+        routeTrail.append(
+            TrailPoint(latitude: coordinate.latitude, longitude: coordinate.longitude, time: Date())
+        )
+        if routeTrail.count > 20_000 { routeTrail.removeFirst(5_000) }
+    }
+
+    @ViewBuilder
+    private var trailControls: some View {
+        if routeTrail.count > 1 {
+            HStack(spacing: 12) {
+                ShareLink(
+                    item: GPXExport(points: routeTrail),
+                    preview: SharePreview("StikDebug-trail.gpx")
+                ) {
+                    Label("Export GPX", systemImage: "square.and.arrow.up")
+                }
+                .buttonStyle(.bordered)
+
+                Button("Clear trail", role: .destructive) { routeTrail = [] }
+                    .buttonStyle(.bordered)
+            }
+        }
+    }
+
     private func resetWanderState() {
+        wanderStatusText = nil
         wanderZoneCenter = nil
         wanderActivePolygon = []
         wanderGoPoints = []
@@ -2323,7 +2478,11 @@ struct LocationSimulationView: View {
         let travelFromHere = wanderTravelFromHere
         let speedFactor = wanderSpeedFactor
         let humanize = wanderHumanize
-        let transport = WanderTravel(mode: wanderTransport, topSpeed: wanderTopSpeedKmh / 3.6)
+        let transport = WanderTravel(
+            mode: wanderTransport,
+            topSpeed: wanderTopSpeedKmh / 3.6,
+            avoidHighways: wanderAvoidHighways
+        )
 
         wanderStarting = true
         Task {
@@ -2334,6 +2493,7 @@ struct LocationSimulationView: View {
                     zone: zone,
                     start: start,
                     origin: origin,
+                    travelRequested: travelFromHere,
                     speedFactor: speedFactor,
                     humanize: humanize,
                     transport: transport
@@ -2353,9 +2513,15 @@ struct LocationSimulationView: View {
     /// Decides whether to travel to the zone from `origin` or just jump there.
     private func wanderApproachPlan(
         origin: CLLocationCoordinate2D?,
-        start: CLLocationCoordinate2D
+        start: CLLocationCoordinate2D,
+        travelRequested: Bool
     ) -> (first: CLLocationCoordinate2D, approachTo: CLLocationCoordinate2D?, notice: String?) {
-        guard let origin else { return (start, nil, nil) }
+        guard let origin else {
+            let notice = travelRequested
+                ? "Could not read your current location (check that location access is allowed for StikDebug), so it jumped to the zone."
+                : nil
+            return (start, nil, notice)
+        }
         let distance = CLLocation(latitude: origin.latitude, longitude: origin.longitude)
             .distance(from: CLLocation(latitude: start.latitude, longitude: start.longitude))
         if distance > 50_000 {
@@ -2371,11 +2537,12 @@ struct LocationSimulationView: View {
         zone: WanderZoneShape,
         start: CLLocationCoordinate2D,
         origin: CLLocationCoordinate2D?,
+        travelRequested: Bool,
         speedFactor: Double,
         humanize: Bool,
         transport: WanderTravel
     ) {
-        let plan = wanderApproachPlan(origin: origin, start: start)
+        let plan = wanderApproachPlan(origin: origin, start: start, travelRequested: travelRequested)
         let first = plan.first
         let approachTo = plan.approachTo
         let notice = plan.notice
@@ -2393,9 +2560,17 @@ struct LocationSimulationView: View {
             let routeID = LocationSimulationSession.shared.startRoute(at: first, coordinates: [first])
             simulatedCoordinate = nil
             routePlaybackCoordinate = first
+            routeTrail = []
+            recordTrail(first)
             wanderGoPoints = []
             wanderZoneCenter = zone.center
             wanderActivePolygon = zone.polygon
+            wanderStatusText = nil
+            if let origin, approachTo != nil {
+                let km = CLLocation(latitude: origin.latitude, longitude: origin.longitude)
+                    .distance(from: CLLocation(latitude: start.latitude, longitude: start.longitude)) / 1000
+                wanderStatusText = String(format: "Traveling to the zone (%.1f km away)…", km)
+            }
             if let notice {
                 alertTitle = "Jumped to the zone"
                 alertMessage = notice
@@ -2432,7 +2607,7 @@ struct LocationSimulationView: View {
             // First travel from where the phone is to the zone, then start wandering.
             if let target = approachTo {
                 if let approach = await goLeg(from: start, to: target, transport: transport), approach.count > 1 {
-                    let scaled = humanizedSamples(approach, speedFactor: speedFactor, humanize: humanize, stopSpacing: transport.stopSpacing)
+                    let scaled = humanizedSamples(approach, speedFactor: speedFactor, humanize: humanize, stopSpacing: transport.stopSpacing, rampDistance: transport.rampDistance)
                     let arrived = await playSamples(
                         Array(scaled.dropFirst()),
                         routeID: routeID,
@@ -2460,6 +2635,8 @@ struct LocationSimulationView: View {
                         }
                     }
                 }
+
+                await MainActor.run { wanderStatusText = nil }
 
                 if await MainActor.run(body: { wanderGoRequested != nil }) {
                     let keepGoing = await driveToRequestedPlaces(
@@ -2511,7 +2688,7 @@ struct LocationSimulationView: View {
                 let prefetch = Task {
                     await wanderLeg(from: end, zone: zone, heading: newHeading, transport: transport)
                 }
-                let scaled = humanizedSamples(samples, speedFactor: speedFactor, humanize: humanize, stopSpacing: transport.stopSpacing)
+                let scaled = humanizedSamples(samples, speedFactor: speedFactor, humanize: humanize, stopSpacing: transport.stopSpacing, rampDistance: transport.rampDistance)
                 let finished = await playSamples(
                     Array(scaled.dropFirst()),
                     routeID: routeID,
@@ -2592,7 +2769,7 @@ struct LocationSimulationView: View {
                     continue
                 }
 
-                let scaled = humanizedSamples(samples, speedFactor: speedFactor, humanize: humanize, stopSpacing: transport.stopSpacing)
+                let scaled = humanizedSamples(samples, speedFactor: speedFactor, humanize: humanize, stopSpacing: transport.stopSpacing, rampDistance: transport.rampDistance)
                 let finished = await playSamples(
                     Array(scaled.dropFirst()),
                     routeID: routeID,
@@ -2623,14 +2800,22 @@ struct LocationSimulationView: View {
             }
             if interrupted { continue }
 
+            let parkMinutes = await MainActor.run { wanderParkMinutes }
+            let parkLimit = parkMinutes * 60
+            let parkStart = Date()
+
             await MainActor.run {
                 wanderGoPoints.removeAll { point in
                     targets.contains { $0.latitude == point.latitude && $0.longitude == point.longitude }
                 }
                 wanderParked = true
+                wanderStatusText = parkLimit > 0
+                    ? "Parked. Resuming in \(Int((parkLimit / 60).rounded(.up))) min"
+                    : nil
             }
 
-            // Stay parked here until the user resumes wandering or queues other places.
+            // Stay parked here until the user resumes wandering, queues other places,
+            // or the chosen stay time runs out.
             var ticks = 0
             while true {
                 guard !Task.isCancelled,
@@ -2640,22 +2825,36 @@ struct LocationSimulationView: View {
                 let (goRequested, resumeRequested) = await MainActor.run {
                     (wanderGoRequested != nil, wanderResumeRequested)
                 }
+                let timeUp = parkLimit > 0 && Date().timeIntervalSince(parkStart) >= parkLimit
                 if goRequested {
-                    await MainActor.run { wanderParked = false }
+                    await MainActor.run {
+                        wanderParked = false
+                        wanderStatusText = nil
+                    }
                     break
                 }
-                if resumeRequested {
+                if resumeRequested || timeUp {
                     await MainActor.run {
                         wanderParked = false
                         wanderResumeRequested = false
+                        wanderStatusText = nil
                     }
                     return true
                 }
                 try? await Task.sleep(for: .milliseconds(300))
                 ticks += 1
-                // Keep re-sending the parked position so it does not drift back.
-                if ticks % 16 == 0, let here = lastSuccessfulCoordinate {
-                    _ = await sendLocationUpdate(for: here)
+                if ticks % 16 == 0 {
+                    // Keep re-sending the parked position so it does not drift back.
+                    if let here = lastSuccessfulCoordinate {
+                        _ = await sendLocationUpdate(for: here)
+                    }
+                    if parkLimit > 0 {
+                        let remaining = max(0, parkLimit - Date().timeIntervalSince(parkStart))
+                        let minutes = Int((remaining / 60).rounded(.up))
+                        await MainActor.run {
+                            wanderStatusText = "Parked. Resuming in \(minutes) min"
+                        }
+                    }
                 }
             }
         }
@@ -2703,7 +2902,7 @@ struct LocationSimulationView: View {
         request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
         request.destination = MKMapItem(placemark: MKPlacemark(coordinate: destination))
         request.requestsAlternateRoutes = false
-        request.transportType = transport.mapKitType
+        transport.configure(request)
 
         guard let route = try? await MKDirections(request: request).calculate().routes.first,
               route.polyline.pointCount > 1 else {
@@ -2750,7 +2949,7 @@ struct LocationSimulationView: View {
             request.source = MKMapItem(placemark: MKPlacemark(coordinate: start))
             request.destination = MKMapItem(placemark: MKPlacemark(coordinate: destination))
             request.requestsAlternateRoutes = false
-            request.transportType = transport.mapKitType
+            transport.configure(request)
 
             guard let route = try? await MKDirections(request: request).calculate().routes.first else {
                 try? await Task.sleep(for: .seconds(1))
